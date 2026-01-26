@@ -48,17 +48,15 @@ class VAESystem:
             "description": "Tiny Conditional Decoder - Fastest with moderate quality"
         },
         "tae-hv": {
-            "class": "TAEW2_1DiffusersWrapper",
+            "class": "LightX2VVAE",
             "default_path": "models/VAEs/lighttaehy1_5.pth",
-            "channels": [256, 128, 64, 64],
-            "is_tcdecoder": True,
+            "is_tcdecoder": False,
             "description": "Light TAE-HV - Good quality/VRAM balance for video"
         },
         "tae-w2.2": {
-            "class": "TAEW2_1DiffusersWrapper",
+            "class": "LightX2VVAE",
             "default_path": "models/VAEs/taew2_2.safetensors",
-            "channels": [256, 128, 64, 64],
-            "is_tcdecoder": True,
+            "is_tcdecoder": False,
             "description": "TAE W2.2 - Improved TAE-HV variant"
         }
     }
@@ -240,7 +238,7 @@ class WanVAELoader:
             raise ValueError(f"No decoder found in {vae_type} weights")
 
         # Create WanVideoVAE instance
-        from diffsynth.models.wan_video_vae import WanVideoVAE
+        from diffsynth.models.wan_video_vae import WanVideoVAE, LightX2VVAE, Wan22VideoVAE
 
         # Different VAE types may have different dimensions
         if vae_type == 'light':
@@ -248,7 +246,13 @@ class WanVAELoader:
             vae_model = WanVideoVAE(z_dim=16, dim=24)
         elif vae_type == 'wan2.2':
             # Wan2.2 has larger dimensions for better quality
-            vae_model = WanVideoVAE(z_dim=96, dim=640)
+            # Dim is 160 based on weight shape [160, 12, 3, 3, 3]
+            # Channels 12 based on weight shape
+            vae_model = Wan22VideoVAE(z_dim=16, dim=160, input_channels=12, output_channels=12)
+        elif vae_type in ['tae-hv', 'tae-w2.2']:
+            # Use LightX2VVAE for tae models
+            # Assuming tae-hv and tae-w2.2 maps to using LightX2VVAE
+            vae_model = LightX2VVAE(z_dim=16, dim=64, use_full_arch=False)
         else:
             # Standard Wan VAE
             vae_model = WanVideoVAE(z_dim=16, dim=96)
@@ -394,6 +398,9 @@ class TCDVAELoader:
 
                 return decoded
 
+            def decode_video(self, *args, **kwargs):
+                return self.tcd_model.decode_video(*args, **kwargs)
+
             def clear_cache(self):
                 if hasattr(self.tcd_model, 'clean_mem'):
                     self.tcd_model.clean_mem()
@@ -424,8 +431,8 @@ class VAELoaderFactory:
         "light": WanVAELoader,
 
         # TAE series
-        "tae-hv": TAEVAELoader,
-        "tae-w2.2": TAEVAELoader,
+        "tae-hv": WanVAELoader, # Changed from TAEVAELoader to WanVAELoader
+        "tae-w2.2": WanVAELoader, # Changed from TAEVAELoader to WanVAELoader
 
         # TCD series
         "tcd": TCDVAELoader,

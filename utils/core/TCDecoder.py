@@ -263,6 +263,28 @@ class TAEHV(nn.Module):
                 nn.Identity(),  # 21
                 conv(64, self.image_channels),  # 22
             )
+        elif vae_type == "tae-hv":
+            # LightVAE structure for tae-hv: 4x internal upsample + 2x pixel shuffle = 8x total
+            base_decoder = nn.Sequential(
+                Clamp(), conv(self.latent_channels, n_f[0]), nn.ReLU(inplace=True),
+
+                MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]),
+                nn.Upsample(scale_factor=2),
+                TGrow(n_f[0], 1),
+                conv(n_f[0], n_f[1], bias=False),
+
+                MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]),
+                nn.Upsample(scale_factor=2),
+                TGrow(n_f[1], 2),
+                conv(n_f[1], n_f[2], bias=False),
+
+                MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]),
+                nn.Identity(),
+                TGrow(n_f[2], 2),
+                conv(n_f[2], n_f[3], bias=False),
+
+                nn.ReLU(inplace=True), conv(n_f[3], self.image_channels),
+            )
         else:
             # Default structure
             base_decoder = nn.Sequential(
@@ -327,10 +349,43 @@ class TAEHV(nn.Module):
         """
         trim_flag = self.mem[-8] is None  # keeps original relative check
 
-        if cond is not None:
-            x = torch.cat([self.pixel_shuffle(cond), x], dim=2)
+        # Robust channel matching logic
+        # Find first Conv2d layer to determine expected input channels
+        first_conv = None
+        for layer in self.decoder:
+            if isinstance(layer, nn.Conv2d):
+                first_conv = layer
+                break
+        
+        if first_conv is not None:
+            expected_channels = first_conv.in_channels
+            current_channels = x.shape[2]
+            
+            use_cond = False
+            pixel_shuffled_cond = None
+            
+            if cond is not None:
+                pixel_shuffled_cond = self.pixel_shuffle(cond)
+                cond_channels = pixel_shuffled_cond.shape[2]
+                
+                if current_channels + cond_channels == expected_channels:
+                    use_cond = True
+            
+            if use_cond:
+                x = torch.cat([pixel_shuffled_cond, x], dim=2)
+            elif current_channels != expected_channels:
+                # Handle channel mismatch (e.g., 16 vs 32)
+                if current_channels == 16 and expected_channels == 32:
+                    # Pad/Repeat to match expected channels
+                    x = torch.cat([x, x], dim=2)
 
         x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem)
+
+        if x.shape[2] == 12:
+            N, T, C, H, W = x.shape
+            x = x.reshape(N * T, C, H, W)
+            x = F.pixel_shuffle(x, 2)
+            x = x.reshape(N, T, 3, H * 2, W * 2)
 
         if trim_flag:
             return x[:, self.frames_to_trim:]
@@ -362,6 +417,9 @@ class TAEW2_1DiffusersWrapper(nn.Module):
     def stream_decode_with_cond(self, latents, tiled=False, cond=None):
         n, c, t, h, w = latents.shape
         return self.taehv.decode_video(latents.transpose(1, 2), parallel=False, cond=cond).transpose(1, 2).mul_(2).sub_(1)
+
+    def decode_video(self, *args, **kwargs):
+        return self.taehv.decode_video(*args, **kwargs)
 
     def clean_mem(self):
         self.taehv.clean_mem()

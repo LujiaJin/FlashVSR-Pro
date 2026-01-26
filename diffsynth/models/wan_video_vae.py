@@ -283,7 +283,8 @@ class Encoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[True, True, False],
-                 dropout=0.0):
+                 dropout=0.0,
+                 in_channels=3):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -297,7 +298,7 @@ class Encoder3d(nn.Module):
         scale = 1.0
 
         # init block
-        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+        self.conv1 = CausalConv3d(in_channels, dims[0], 3, padding=1)
 
         # downsample blocks
         downsamples = []
@@ -386,7 +387,8 @@ class Decoder3d(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_upsample=[False, True, True],
-                 dropout=0.0):
+                 dropout=0.0,
+                 out_channels=3):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -428,7 +430,7 @@ class Decoder3d(nn.Module):
 
         # output blocks
         self.head = nn.Sequential(RMS_norm(out_dim, images=False), nn.SiLU(),
-                                  CausalConv3d(out_dim, 3, 3, padding=1))
+                                  CausalConv3d(out_dim, out_channels, 3, padding=1))
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         ## conv1
@@ -499,7 +501,9 @@ class VideoVAE_(nn.Module):
                  num_res_blocks=2,
                  attn_scales=[],
                  temperal_downsample=[False, True, True],
-                 dropout=0.0):
+                 dropout=0.0,
+                 input_channels=3,
+                 output_channels=3):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -511,11 +515,11 @@ class VideoVAE_(nn.Module):
 
         # modules
         self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_downsample, dropout)
+                                 attn_scales, self.temperal_downsample, dropout, in_channels=input_channels)
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_upsample, dropout)
+                                 attn_scales, self.temperal_upsample, dropout, out_channels=output_channels)
 
     def forward(self, x):
         mu, log_var = self.encode(x)
@@ -628,7 +632,7 @@ class VideoVAE_(nn.Module):
 
 class WanVideoVAE(nn.Module):
 
-    def __init__(self, z_dim=16, dim=96):
+    def __init__(self, z_dim=16, dim=96, input_channels=3, output_channels=3):
         super().__init__()
 
         mean = [
@@ -644,9 +648,31 @@ class WanVideoVAE(nn.Module):
         self.scale = [self.mean, 1.0 / self.std]
 
         # init model
-        self.model = VideoVAE_(z_dim=z_dim, dim = dim).eval().requires_grad_(False)
+        self.model = VideoVAE_(z_dim=z_dim, dim = dim, input_channels=input_channels, output_channels=output_channels).eval().requires_grad_(False)
         self.upsampling_factor = 8
 
+    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
+        """
+        Adapter for TCDecoder interface compatibility.
+        x: [B, T, C, H, W] latent tensor.
+        Returns: [B, T, C, H, W] RGB tensor in [0, 1].
+        """
+        # Transpose to [B, C, T, H, W] for WanVAE
+        x_in = x.transpose(1, 2)
+        
+        # Decode (returns [-1, 1])
+        # Use single_decode as default strategy
+        decoded = self.single_decode(x_in, x_in.device)
+        
+        # Convert [-1, 1] -> [0, 1]
+        out = (decoded + 1.0) / 2.0
+        
+        # Transpose back to [B, T, C, H, W]
+        return out.transpose(1, 2)
+
+    def clean_mem(self):
+        if hasattr(self, 'clear_cache'):
+            self.clear_cache()
 
     def build_1d_mask(self, length, left_bound, right_bound, border_width):
         x = torch.ones((length,))
@@ -845,3 +871,223 @@ class WanVideoVAEStateDictConverter:
         for name in state_dict:
             state_dict_['model.' + name] = state_dict[name]
         return state_dict_
+
+
+# =====================================================================
+# LightX2V / LightVAE Implementation
+# =====================================================================
+
+VAE_FULL_DIM = 96
+VAE_LIGHT_DIM = 64
+VAE_Z_DIM = 16
+VAE_UPSAMPLING_FACTOR = 8
+
+class LightVideoVAE_(nn.Module):
+    def __init__(self,
+                 dim=VAE_LIGHT_DIM,
+                 z_dim=VAE_Z_DIM,
+                 dim_mult=[1, 2, 4, 4],
+                 num_res_blocks=1,
+                 attn_scales=[],
+                 temperal_downsample=[False, True, True],
+                 dropout=0.0):
+        super().__init__()
+        self.dim = dim
+        self.z_dim = z_dim
+        self.dim_mult = dim_mult
+        self.num_res_blocks = num_res_blocks
+        self.attn_scales = attn_scales
+        self.temperal_downsample = temperal_downsample
+        self.temperal_upsample = temperal_downsample[::-1]
+
+        # modules
+        self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
+                                 attn_scales, self.temperal_downsample, dropout)
+        self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
+        self.conv2 = CausalConv3d(z_dim, z_dim, 1)
+        self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
+                                 attn_scales, self.temperal_upsample, dropout)
+
+    def forward(self, x):
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        x_recon = self.decode(z)
+        return x_recon, mu, log_var
+
+    def encode(self, x, scale):
+        self.clear_cache()
+        t = x.shape[2]
+        iter_ = 1 + (t - 1) // 4
+
+        for i in range(iter_):
+            self._enc_conv_idx = [0]
+            if i == 0:
+                out = self.encoder(x[:, :, :1, :, :],
+                                   feat_cache=self._enc_feat_map,
+                                   feat_idx=self._enc_conv_idx)
+            else:
+                out_ = self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                                    feat_cache=self._enc_feat_map,
+                                    feat_idx=self._enc_conv_idx)
+                out = torch.cat([out, out_], 2)
+        mu, log_var = self.conv1(out).chunk(2, dim=1)
+        if isinstance(scale[0], torch.Tensor):
+            scale = [s.to(dtype=mu.dtype, device=mu.device) for s in scale]
+            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            scale = scale.to(dtype=mu.dtype, device=mu.device)
+            mu = (mu - scale[0]) * scale[1]
+        return mu
+
+    def decode(self, z, scale):
+        self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            scale = scale.to(dtype=z.dtype, device=z.device)
+            z = z / scale[1] + scale[0]
+        iter_ = z.shape[2]
+        x = self.conv2(z)
+        for i in range(iter_):
+            self._conv_idx = [0]
+            if i == 0:
+                out = self.decoder(x[:, :, i:i + 1, :, :],
+                                   feat_cache=self._feat_map,
+                                   feat_idx=self._conv_idx)
+            else:
+                out_ = self.decoder(x[:, :, i:i + 1, :, :],
+                                    feat_cache=self._feat_map,
+                                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2)
+        return out
+
+    def stream_decode(self, z, scale):
+        if isinstance(scale[0], torch.Tensor):
+            scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            scale = scale.to(dtype=z.dtype, device=z.device)
+            z = z / scale[1] + scale[0]
+        iter_ = z.shape[2]
+        x = self.conv2(z)
+        for i in range(iter_):
+            self._conv_idx = [0]
+            if i == 0:
+                out = self.decoder(x[:, :, i:i + 1, :, :],
+                                   feat_cache=self._feat_map,
+                                   feat_idx=self._conv_idx)
+            else:
+                out_ = self.decoder(x[:, :, i:i + 1, :, :],
+                                    feat_cache=self._feat_map,
+                                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2)
+        return out
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+    def sample(self, imgs, deterministic=False):
+        mu, log_var = self.encode(imgs)
+        if deterministic:
+            return mu
+        std = torch.exp(0.5 * log_var.clamp(-30.0, 20.0))
+        return mu + std * torch.randn_like(std)
+
+    def clear_cache(self):
+        self._conv_num = count_conv3d(self.decoder)
+        self._conv_idx = [0]
+        self._feat_map = [None] * self._conv_num
+        if self.encoder is not None:
+            self._enc_conv_num = count_conv3d(self.encoder)
+            self._enc_conv_idx = [0]
+            self._enc_feat_map = [None] * self._enc_conv_num
+
+
+class Wan22VideoVAE(nn.Module):
+    """
+    Wan2.2 Video VAE - Updated normalization statistics for the
+    improved Wan2.2 training regime. Architecture is compatible with
+    Wan2.1 VAE weights with automatic fallback.
+    """
+
+    def __init__(self, z_dim=16, dim=96, input_channels=3, output_channels=3):
+        super().__init__()
+
+        # Wan2.2 updated normalization statistics
+        # These are optimized for the expanded Wan2.2 training dataset
+        mean = [
+            -0.7524, -0.7052, -0.9088, 0.1098, -0.1712, 0.9681, -0.1489, 1.5534,
+            0.4168, -0.0692, 0.5549, -0.3601, -0.1894, -0.9469, 0.2531, -0.2893
+        ]
+        std = [
+            2.8256, 1.4589, 2.3342, 2.6625, 1.2248, 1.7762, 2.6118, 2.0809,
+            3.2754, 2.1593, 2.8719, 1.5632, 1.6435, 1.1305, 2.8318, 1.9213
+        ]
+        self.mean = torch.tensor(mean)
+        self.std = torch.tensor(std)
+        self.scale = [self.mean, 1.0 / self.std]
+
+        # Fallback to Wan2.1 stats for compatibility
+        self._wan21_mean = torch.tensor([
+            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
+        ])
+        self._wan21_std = torch.tensor([
+            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
+        ])
+
+        # init model - same architecture as Wan2.1
+        self.model = VideoVAE_(z_dim=z_dim, dim=dim, input_channels=input_channels, output_channels=output_channels).eval().requires_grad_(False)
+        self.upsampling_factor = 8
+        self.vae_type = "wan2.2"
+
+    def forward(self, x):
+        return self.model(x)
+
+    def encode(self, x):
+        return self.model.encode(x, self.scale)
+
+    def decode(self, z):
+        return self.model.decode(z, self.scale)
+
+    def stream_decode(self, z):
+        return self.model.stream_decode(z, self.scale)
+
+    def sample(self, x, deterministic=False):
+        return self.model.sample(x, deterministic)
+
+    def clear_cache(self):
+        self.model.clear_cache()
+
+class LightX2VVAE(WanVideoVAE):
+    def __init__(self, z_dim=16, dim=64, use_full_arch=False):
+        nn.Module.__init__(self)
+
+        mean = [
+            -0.7548, -0.7070, -0.9100, 0.1086, -0.1728, 0.9667, -0.1503, 1.5521,
+            0.4151, -0.0703, 0.5533, -0.3616, -0.1908, -0.9483, 0.2517, -0.2907
+        ]
+        std = [
+            2.8220, 1.4565, 2.3308, 2.6591, 1.2222, 1.7735, 2.6085, 2.0776,
+            3.2720, 2.1559, 2.8685, 1.5605, 1.6408, 1.1279, 2.8284, 1.9186
+        ]
+        self.mean = torch.tensor(mean)
+        self.std = torch.tensor(std)
+        self.scale = [self.mean, 1.0 / self.std]
+
+        # Initialize model
+        if use_full_arch:
+            self.model = VideoVAE_(z_dim=z_dim, dim=96).eval().requires_grad_(False)
+        else:
+            self.model = LightVideoVAE_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)
+
+        self.upsampling_factor = 8
+        self.vae_type = "lightx2v"
+
