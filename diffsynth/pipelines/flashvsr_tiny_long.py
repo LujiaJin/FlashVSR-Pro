@@ -110,8 +110,23 @@ class TorchColorCorrectorWavelet(nn.Module):
         method: Literal['wavelet', 'adain'] = 'wavelet',
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
-        assert hq_image.shape == lq_image.shape, "HQ 与 LQ 的形状必须一致"
+        # Check basic dimensions
         assert hq_image.dim() == 5 and hq_image.shape[1] == 3, "输入必须是 (B, 3, f, H, W)"
+        
+        # Auto-resize lq_image if spatial dimensions mismatch (Robustness Fix)
+        if hq_image.shape[-2:] != lq_image.shape[-2:]:
+            lq_flat, B_lq, f_lq = self._flatten_time(lq_image)
+            lq_flat = F.interpolate(
+                lq_flat, 
+                size=(hq_image.shape[-2], hq_image.shape[-1]), 
+                mode='bilinear', 
+                align_corners=False
+            )
+            lq_image = self._unflatten_time(lq_flat, B_lq, f_lq)
+
+        # Ensure shapes match now
+        if hq_image.shape != lq_image.shape:
+             raise ValueError(f"ColorCorrector Shape Mismatch: HQ {hq_image.shape} vs LQ {lq_image.shape}")
 
         B, C, f, H, W = hq_image.shape
         if chunk_size is None or chunk_size >= f:
@@ -427,7 +442,8 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                             chunk_size=None,
                             method='adain'
                         )
-                except:
+                except Exception as e:
+                    print(f"[ColorFix Error] {e}")
                     pass
 
                 frames_total.append(cur_frames.to('cpu'))

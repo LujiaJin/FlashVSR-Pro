@@ -328,8 +328,11 @@ def vae_decode_tiled(
     # Store tile results
     output_tiles = []
     
-    # Always use tqdm so we can show the description (e.g. "Decoding video: 100%|...| 1/1")
-    # This aligns with user request for inline label.
+    # Update description to include (Tiled)
+    if not desc.endswith("(Tiled)"):
+        desc += " (Tiled)"
+    
+    # Always use tqdm so we can show the description (e.g. "Decoding video (Tiled): 100%|...| 16/16")
     pbar = tqdm(coords, desc=desc)
         
     for idx, (x1, y1, x2, y2) in enumerate(pbar):
@@ -337,12 +340,55 @@ def vae_decode_tiled(
         tile = latents[:, :, :, y1:y2, x1:x2]
         
         # Decode using the selected decoder function
-        tile_decoded = decoder(tile, **kwargs)
+        # Silence inner tqdm if kwargs has 'decoding_msg', remove it for inner calls
+        inner_kwargs = kwargs.copy()
+        if 'decoding_msg' in inner_kwargs:
+            inner_kwargs.pop('decoding_msg')
+            
+        tile_decoded = decoder(tile, **inner_kwargs)
         output_tiles.append(tile_decoded)
     
+    # Calculate scale factor from the first tile
+    # tile input H: (y2-y1), decoded H: output_tiles[0].shape[-2]
+    # Assuming output is (B, C, T, H, W) or (C, T, H, W)
+    if output_tiles:
+        first_tile_in_h = coords[0][3] - coords[0][1]
+        first_tile_out_h = output_tiles[0].shape[-2]
+        # Round scale to nearest integer to avoid float precision issues with very small tiles
+        scale = int(round(first_tile_out_h / first_tile_in_h))
+    else:
+        scale = 1
+
     # Stitch
     final_output = stitch_video_tiles_back(
-        output_tiles, coords, (H, W), overlap, scale=1
+        output_tiles, coords, (H, W), overlap, scale=scale
     )
     
-    return final_output.squeeze(2) if is_image else final_output
+    # Check if final_output lost its channel dimension or is squeezed inappropriately
+    # stitch_video_tiles_back returns (C, T, H, W).
+    # Input was (B, C, T, H, W) or (C, T, H, W) if B=1 is handled inside.
+    
+    # If original input had batch dimension, we might need to restore it?
+    # But wait, vae_decode_tiled is expected to return (C, T, H, W) or (B, C, T, H, W)?
+    # FlashVSR Pipeline expects (1, 3, F, H, W) usually.
+    # stitch_video_tiles_back returns (C, T, H_scaled, W_scaled).
+    
+    # The error says "Received 3-dim tensor: [85, 768, 768]". This looks like (T, H, W).
+    # Missing C dimension!
+    
+    # Let's check why C dimension is lost.
+    # stitch_video_tiles_back: "canvas = torch.zeros((C, T, H_scaled, W_scaled)..."
+    # It returns canvas / weight_canvas.
+    
+    # However, `WanVideoVAE.decode` returns (C, T, H, W)? Or (3, T, H, W)?
+    # Wait, `WanVideoVAE.single_decode` -> `model.decode` -> `video.clamp_(-1, 1)`
+    # Let's look at `WanVideoVAE.decode` again.
+    # It stacks videos.
+    
+    if is_image:
+         return final_output.squeeze(2)
+    else:
+         # Restoring batch dimension if input had it
+         if B == 1:
+             return final_output.unsqueeze(0)
+         return final_output

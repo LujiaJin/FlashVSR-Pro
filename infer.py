@@ -101,8 +101,8 @@ def parse_args():
                        help="Local attention range (9=sharper, 11=stable)")
     parser.add_argument("--color-fix", action="store_true",
                        help="Apply color correction")
-    parser.add_argument("--fps", type=int, default=30,
-                       help="Output FPS (for image sequences)")
+    parser.add_argument("--fps", type=int, default=None,
+                       help="Output FPS (default: match input or 30 for images)")
     parser.add_argument("--quality", type=int, default=10,
                        help="Output video quality (0-10)")
     
@@ -117,6 +117,10 @@ def parse_args():
 
 def tensor2video(frames: torch.Tensor):
     """Convert tensor to list of PIL Images"""
+    # Handle optional batch dimension
+    if frames.ndim == 5:
+        frames = frames.squeeze(0)
+    
     frames = rearrange(frames, "C T H W -> T H W C")
     frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
     frames = [Image.fromarray(frame) for frame in frames]
@@ -601,6 +605,10 @@ def main():
         device=args.device
     )
     
+    # Override FPS if specified by user
+    if args.fps is not None:
+        fps = args.fps
+    
     # Initialize pipeline with VAE manager
     pipe, vae_instance = init_pipeline(args)
     
@@ -622,6 +630,31 @@ def main():
         # Add optional parameter flags
         if args.keep_audio:
             fn_parts.append("audio")
+        
+        if args.fps is not None:
+            fn_parts.append(f"fps{args.fps}")
+
+        if args.color_fix:
+            fn_parts.append("colorfix")
+            
+        if args.quality != 10:
+            fn_parts.append(f"q{args.quality}")
+
+        # Add advanced parameter flags if non-default
+        if args.seed != 0:
+            fn_parts.append(f"seed{args.seed}")
+            
+        if args.sparse_ratio != 2.0:
+            fn_parts.append(f"sparse{args.sparse_ratio}")
+            
+        if args.kv_ratio != 3.0:
+            fn_parts.append(f"kv{args.kv_ratio}")
+            
+        if args.local_range != 11:
+            fn_parts.append(f"lr{args.local_range}")
+            
+        if args.dtype != "bf16":
+            fn_parts.append(args.dtype)
             
         # Add tiling flags
         is_tiled = False
