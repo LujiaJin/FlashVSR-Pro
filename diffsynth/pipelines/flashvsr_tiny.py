@@ -1,16 +1,9 @@
-import types
-import os
-import time
 from typing import Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from einops import rearrange
-from PIL import Image
 from tqdm import tqdm
-# import pyfiglet
 
 from ..models import ModelManager
 from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
@@ -20,10 +13,10 @@ from .base import BasePipeline
 
 
 # -----------------------------
-# 基础工具：ADAIN 所需的统计量（保留以备需要；管线默认用 wavelet）
+# Basic utilities: Statistics for ADAIN (Reserved if needed; pipeline defaults to wavelet)
 # -----------------------------
 def _calc_mean_std(feat: torch.Tensor, eps: float = 1e-5) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert feat.dim() == 4, 'feat 必须是 (N, C, H, W)'
+    assert feat.dim() == 4, 'feat must be (N, C, H, W)'
     N, C = feat.shape[:2]
     var = feat.view(N, C, -1).var(dim=2, unbiased=False) + eps
     std = var.sqrt().view(N, C, 1, 1)
@@ -32,7 +25,7 @@ def _calc_mean_std(feat: torch.Tensor, eps: float = 1e-5) -> Tuple[torch.Tensor,
 
 
 def _adain(content_feat: torch.Tensor, style_feat: torch.Tensor) -> torch.Tensor:
-    assert content_feat.shape[:2] == style_feat.shape[:2], "ADAIN: N、C 必须匹配"
+    assert content_feat.shape[:2] == style_feat.shape[:2], "ADAIN: N, C must match"
     size = content_feat.size()
     style_mean, style_std = _calc_mean_std(style_feat)
     content_mean, content_std = _calc_mean_std(content_feat)
@@ -41,7 +34,7 @@ def _adain(content_feat: torch.Tensor, style_feat: torch.Tensor) -> torch.Tensor
 
 
 # -----------------------------
-# 小波式模糊与分解/重构（ColorCorrector 用）
+# Wavelet-based blur and decomposition/reconstruction (Used by ColorCorrector)
 # -----------------------------
 def _make_gaussian3x3_kernel(dtype, device) -> torch.Tensor:
     vals = [
@@ -53,7 +46,7 @@ def _make_gaussian3x3_kernel(dtype, device) -> torch.Tensor:
 
 
 def _wavelet_blur(x: torch.Tensor, radius: int) -> torch.Tensor:
-    assert x.dim() == 4, 'x 必须是 (N, C, H, W)'
+    assert x.dim() == 4, 'x must be (N, C, H, W)'
     N, C, H, W = x.shape
     base = _make_gaussian3x3_kernel(x.dtype, x.device)
     weight = base.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
@@ -64,7 +57,7 @@ def _wavelet_blur(x: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 def _wavelet_decompose(x: torch.Tensor, levels: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 4, 'x 必须是 (N, C, H, W)'
+    assert x.dim() == 4, 'x must be (N, C, H, W)'
     high = torch.zeros_like(x)
     low = x
     for i in range(levels):
@@ -82,7 +75,7 @@ def _wavelet_reconstruct(content: torch.Tensor, style: torch.Tensor, levels: int
 
 
 # -----------------------------
-# 无状态颜色矫正模块（视频友好，默认 wavelet）
+# Stateless Color Correction Module (Video-friendly, defaults to wavelet)
 # -----------------------------
 class TorchColorCorrectorWavelet(nn.Module):
     def __init__(self, levels: int = 5):
@@ -91,7 +84,7 @@ class TorchColorCorrectorWavelet(nn.Module):
 
     @staticmethod
     def _flatten_time(x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
-        assert x.dim() == 5, '输入必须是 (B, C, f, H, W)'
+        assert x.dim() == 5, 'Input must be (B, C, f, H, W)'
         B, C, f, H, W = x.shape
         y = x.permute(0, 2, 1, 3, 4).reshape(B * f, C, H, W)
         return y, B, f
@@ -111,7 +104,7 @@ class TorchColorCorrectorWavelet(nn.Module):
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         # Check basic dimensions
-        assert hq_image.dim() == 5 and hq_image.shape[1] == 3, "输入必须是 (B, 3, f, H, W)"
+        assert hq_image.dim() == 5 and hq_image.shape[1] == 3, "Input must be (B, 3, f, H, W)"
         
         # Auto-resize lq_image if spatial dimensions mismatch (Robustness Fix)
         if hq_image.shape[-2:] != lq_image.shape[-2:]:
@@ -137,7 +130,7 @@ class TorchColorCorrectorWavelet(nn.Module):
             elif method == 'adain':
                 out4 = _adain(hq4, lq4)
             else:
-                raise ValueError(f"未知 method: {method}")
+                raise ValueError(f"Unknown method: {method}")
             out4 = torch.clamp(out4, *clip_range)
             out = self._unflatten_time(out4, B, f)
             return out
@@ -154,7 +147,7 @@ class TorchColorCorrectorWavelet(nn.Module):
             elif method == 'adain':
                 out4 = _adain(hq4, lq4)
             else:
-                raise ValueError(f"未知 method: {method}")
+                raise ValueError(f"Unknown method: {method}")
             out4 = torch.clamp(out4, *clip_range)
             out_chunk = self._unflatten_time(out4, B_, f_)
             outs.append(out_chunk)
@@ -163,7 +156,7 @@ class TorchColorCorrectorWavelet(nn.Module):
 
 
 # -----------------------------
-# 简化版 Pipeline（仅 dit + vae）
+# Simplified Pipeline (DiT + VAE only)
 # -----------------------------
 class FlashVSRTinyPipeline(BasePipeline):
 
@@ -180,7 +173,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
 
     def enable_vram_management(self, num_persistent_param_in_dit=None):
-        # 仅管理 dit / vae
+        # Only manage dit / vae
         dtype = next(iter(self.dit.parameters())).dtype
         from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
         enable_vram_management(
@@ -221,7 +214,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         if torch_dtype is None: torch_dtype = model_manager.torch_dtype
         pipe = FlashVSRTinyPipeline(device=device, torch_dtype=torch_dtype)
         pipe.fetch_models(model_manager)
-        # 可选：统一序列并行入口（此处默认关闭）
+        # Optional: Unified Sequence Parallelism (Default off here)
         pipe.use_unified_sequence_parallel = False
         return pipe
 
@@ -229,7 +222,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         return self.dit
 
     # -------------------------
-    # 新增：显式 KV 预初始化函数
+    # Added: Explicit KV Pre-initialization Function
     # -------------------------
     def init_cross_kv(
         self,
@@ -237,17 +230,17 @@ class FlashVSRTinyPipeline(BasePipeline):
     ):
         self.load_models_to_device(["dit"])
         """
-        使用固定 prompt 生成文本 context，并在 WanModel 中初始化所有 CrossAttention 的 KV 缓存。
-        必须在 __call__ 前显式调用一次。
+        Generate text context using fixed prompt and initialize all CrossAttention KV caches in WanModel.
+        Must be explicitly called once before __call__.
         """
         prompt_path = "models/prompt_tensor/posi_prompt.pth"
 
         if self.dit is None:
-            raise RuntimeError("请先通过 fetch_models / from_model_manager 初始化 self.dit")
+            raise RuntimeError("Please initialize self.dit first via fetch_models / from_model_manager")
 
         if context_tensor is None:
             if prompt_path is None:
-                raise ValueError("init_cross_kv: 需要提供 prompt_path 或 context_tensor 其一")
+                raise ValueError("init_cross_kv: Either prompt_path or context_tensor must be provided")
             ctx = torch.load(prompt_path, map_location=self.device)
         else:
             ctx = context_tensor
@@ -261,7 +254,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         if hasattr(self.dit, "reinit_cross_kv"):
             self.dit.reinit_cross_kv(ctx)
         else:
-            raise AttributeError("WanModel 缺少 reinit_cross_kv(ctx) 方法，请在模型实现中加入该能力。")
+            raise AttributeError("WanModel is missing reinit_cross_kv(ctx) method, please add this capability in the model implementation.")
         self.timestep = torch.tensor([1000.], device=self.device, dtype=self.torch_dtype)
         self.t = self.dit.time_embedding(sinusoidal_embedding_1d(self.dit.freq_dim, self.timestep))
         self.t_mod = self.dit.time_projection(self.t).unflatten(1, (6, self.dit.dim))
@@ -449,8 +442,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         tiled=False,
         tile_size=(60, 104),
         tile_stride=(30, 52),
-        tea_cache_l1_thresh=None,
-        tea_cache_model_id="Wan2.1-T2V-14B",
+        # Removed unused TeaCache arguments
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
         LQ_video=None,
@@ -462,28 +454,28 @@ class FlashVSRTinyPipeline(BasePipeline):
         color_fix = True,
         decoding_msg = None,
     ):
-        # 只接受 cfg=1.0（与原代码一致）
+        # Only accept cfg=1.0 (Consistent with original code)
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
 
-        # 要求：必须先 init_cross_kv()
+        # Requirement: init_cross_kv() must be called first
         if self.prompt_emb_posi is None or 'context' not in self.prompt_emb_posi:
             raise RuntimeError(
-                "Cross-Attn KV 未初始化。请在调用 __call__ 前先执行：\n"
+                "Cross-Attn KV not initialized. Please execute before calling __call__:\n"
                 "    pipe.init_cross_kv()\n"
-                "或传入自定义 context：\n"
+                "or pass custom context:\n"
                 "    pipe.init_cross_kv(context_tensor=your_context_tensor)"
             )
 
-        # 尺寸修正
+        # Dimension Correction
         height, width = self.check_resize_height_width(height, width)
         if num_frames % 4 != 1:
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
 
-        # Tiler 参数
+        # Tiler Parameters
         tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
 
-        # 初始化噪声
+        # Initialize Noise
         if if_buffer:
             noise = self.generate_noise((1, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
         else:
@@ -494,7 +486,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
 
-        # 清理可能存在的 LQ_proj_in cache
+        # Clear potential LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
 
@@ -540,7 +532,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
-                # 推理（无 motion_controller / vace）
+                # Inference (No motion_controller / vace)
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
                     x=cur_latents,
@@ -561,7 +553,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     local_range = local_range,
                 )
 
-                # 更新 latent
+                # Update latent
                 cur_latents = cur_latents - noise_pred_posi
                 latents_total.append(cur_latents)
                 LQ_pre_idx = LQ_cur_idx
@@ -588,7 +580,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     decoding_msg=decoding_msg if decoding_msg else "Decoding video" # If no msg, default to "Decoding video"
                 ).transpose(1, 2).mul_(2).sub_(1)
 
-            # 颜色校正（wavelet）
+            # Color correction (wavelet)
             try:
                 if color_fix:
                     frames = self.ColorCorrector(
@@ -605,66 +597,17 @@ class FlashVSRTinyPipeline(BasePipeline):
         return frames[0]
 
 
-# -----------------------------
-# TeaCache（保留原逻辑；此处默认不启用）
-# -----------------------------
-class TeaCache:
-    def __init__(self, num_inference_steps, rel_l1_thresh, model_id):
-        self.num_inference_steps = num_inference_steps
-        self.step = 0
-        self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = None
-        self.rel_l1_thresh = rel_l1_thresh
-        self.previous_residual = None
-        self.previous_hidden_states = None
-        
-        self.coefficients_dict = {
-            "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
-            "Wan2.1-T2V-14B":  [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
-            "Wan2.1-I2V-14B-480P": [2.57151496e+05, -3.54229917e+04,  1.40286849e+03, -1.35890334e+01, 1.32517977e-01],
-            "Wan2.1-I2V-14B-720P":  [8.10705460e+03,  2.13393892e+03, -3.72934672e+02,  1.66203073e+01, -4.17769401e-02],
-        }
-        if model_id not in self.coefficients_dict:
-            supported_model_ids = ", ".join([i for i in self.coefficients_dict])
-            raise ValueError(f"{model_id} is not a supported TeaCache model id. Please choose a valid model id in ({supported_model_ids}).")
-        self.coefficients = self.coefficients_dict[model_id]
-
-    def check(self, dit: WanModel, x, t_mod):
-        modulated_inp = t_mod.clone()
-        if self.step == 0 or self.step == self.num_inference_steps - 1:
-            should_calc = True
-            self.accumulated_rel_l1_distance = 0
-        else:
-            coefficients = self.coefficients
-            rescale_func = np.poly1d(coefficients)
-            self.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
-            should_calc = not (self.accumulated_rel_l1_distance < self.rel_l1_thresh)
-            if should_calc:
-                self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = modulated_inp
-        self.step = (self.step + 1) % self.num_inference_steps
-        if should_calc:
-            self.previous_hidden_states = x.clone()
-        return not should_calc
-
-    def store(self, hidden_states):
-        self.previous_residual = hidden_states - self.previous_hidden_states
-        self.previous_hidden_states = None
-
-    def update(self, hidden_states):
-        hidden_states = hidden_states + self.previous_residual
-        return hidden_states
 
 
 # -----------------------------
-# 简化版模型前向封装（无 vace / 无 motion_controller）
+# Simplified Model Forward Wrapper (No vace / No motion_controller)
 # -----------------------------
 def model_fn_wan_video(
     dit: WanModel,
     x: torch.Tensor,
     timestep: torch.Tensor,
     context: torch.Tensor,
-    tea_cache: Optional[TeaCache] = None,
+    tea_cache: Optional[object] = None, # Reserved for compatibility
     use_unified_sequence_parallel: bool = False,
     LQ_latents: Optional[torch.Tensor] = None,
     is_full_block: bool = False,
@@ -690,7 +633,7 @@ def model_fn_wan_video(
     topk = int(square_num * topk_ratio) - 1
     kv_len = int(kv_ratio)
 
-    # RoPE 位置（分段）
+    # RoPE Position (Segmented)
     if cur_process_idx == 0:
         freqs = torch.cat([
             dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -704,10 +647,7 @@ def model_fn_wan_video(
             dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-    # TeaCache（默认不启用）
-    tea_cache_update = tea_cache.check(dit, x, t_mod) if tea_cache is not None else False
-
-    # 统一序列并行（此处默认关闭）
+    # Unified Sequence Parallel (Default OFF)
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import (get_sequence_parallel_rank,
@@ -716,26 +656,23 @@ def model_fn_wan_video(
         if dist.is_initialized() and dist.get_world_size() > 1:
             x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
-    # Block 堆叠
-    if tea_cache_update:
-        x = tea_cache.update(x)
-    else:
-        for block_id, block in enumerate(dit.blocks):
-            if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
-            x, last_pre_cache_k, last_pre_cache_v = block(
-                x, context, t_mod, freqs, f, h, w,
-                local_num, topk,
-                block_id=block_id,
-                kv_len=kv_len,
-                is_full_block=is_full_block,
-                is_stream=is_stream,
-                pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
-                pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
-                local_range = local_range,
-            )
-            if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
-            if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
+    # Block Stacking
+    for block_id, block in enumerate(dit.blocks):
+        if LQ_latents is not None and block_id < len(LQ_latents):
+            x = x + LQ_latents[block_id]
+        x, last_pre_cache_k, last_pre_cache_v = block(
+            x, context, t_mod, freqs, f, h, w,
+            local_num, topk,
+            block_id=block_id,
+            kv_len=kv_len,
+            is_full_block=is_full_block,
+            is_stream=is_stream,
+            pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
+            pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+            local_range = local_range,
+        )
+        if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
+        if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:

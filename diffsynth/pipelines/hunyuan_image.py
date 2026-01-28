@@ -58,13 +58,13 @@ class ImageSizeManager:
             num = (stop[0] - start[0], stop[1] - start[1])
         elif len(args) == 2:
             # start is start, args[0] is stop, args[1] is num
-            start = self._to_tuple(start)       # 左上角   eg: 12,0
-            stop = self._to_tuple(args[0])      # 右下角   eg: 20,32
-            num = self._to_tuple(args[1])       # 目标大小  eg: 32,124
+            start = self._to_tuple(start)       # top-left   eg: 12,0
+            stop = self._to_tuple(args[0])      # bottom-right   eg: 20,32
+            num = self._to_tuple(args[1])       # target size  eg: 32,124
         else:
             raise ValueError(f"len(args) should be 0, 1 or 2, but got {len(args)}")
 
-        grid_h = np.linspace(start[0], stop[0], num[0], endpoint=False, dtype=np.float32) # 12-20 中间差值32份   0-32 中间差值124份
+        grid_h = np.linspace(start[0], stop[0], num[0], endpoint=False, dtype=np.float32) # interpolate 32 parts between 12-20   interpolate 124 parts between 0-32
         grid_w = np.linspace(start[1], stop[1], num[1], endpoint=False, dtype=np.float32)
         grid = np.meshgrid(grid_w, grid_h)  # here w goes first
         grid = np.stack(grid, axis=0)   # [2, W, H]
@@ -73,7 +73,7 @@ class ImageSizeManager:
 
     def get_2d_rotary_pos_embed(self, embed_dim, start, *args, use_real=True):
         grid = self.get_meshgrid(start, *args)   # [2, H, w]
-        grid = grid.reshape([2, 1, *grid.shape[1:]])   # 返回一个采样矩阵  分辨率与目标分辨率一致
+        grid = grid.reshape([2, 1, *grid.shape[1:]])   # Returns a sampling matrix, resolution consistent with target resolution
         pos_embed = self.get_2d_rotary_pos_embed_from_grid(embed_dim, grid, use_real=use_real)
         return pos_embed
 

@@ -19,7 +19,11 @@ This project builds upon the core FlashVSR algorithm and introduces several key 
 *   **💾 Tiled Inference for Reduced VRAM**: Implements a tiling mechanism for the DiT model, significantly lowering GPU memory requirements and enabling processing of higher-resolution videos or operation on GPUs with limited VRAM. *(The concept for tiled DiT inference was inspired by the [FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus) project.)*
 *   **🐳 Optimized Docker Container**: A fully-configured Dockerfile that automatically sets up the complete environment, including Conda environment activation upon container startup.
 *   **🔧 Automated Block-Sparse Attention Installation**: Optimizes and automates the installation of the Block-Sparse-Attention backend within the Docker build process. This eliminates the manual compilation complexity encountered in the original implementation, ensuring a seamless setup experience. My specific improvements to Block-Sparse-Attention are documented in this PR: [mit-han-lab/Block-Sparse-Attention#16](https://github.com/mit-han-lab/Block-Sparse-Attention/pull/16#issue-3800081298).
-*   **⚡ Performance Optimizations**: Comprehensive speed enhancements including optimized device transfers, suppressed verbose outputs, streamlined memory management, and reduced redundant operations. Achieves 20-30% performance improvement for high-throughput video processing scenarios.
+*   **⚡ Enterprise-Grade Performance Optimizations**: Engineered for high-end GPUs (A100/H100/H200, etc), this project features a **Zero-Copy Pipeline**, **Hardware Acceleration** (TF32/cuDNN), **Asynchronous Execution**, and **NVENC Video Encoding**, maximizing throughput and eliminating bottlenecks for production-grade video processing.
+*   **� Strict Precision Alignment (Duration & Resolution)**: Implements smart padding strategies to overcome algorithmic block-size constraints (e.g., 8n+1 frames, mod-128 resolution) without data loss.
+    *   **Exact Duration**: Ensures output frame count perfectly matches input, solving the "missing seconds" issue and guaranteeing perfect audio sync (e.g., Input 5.0s → Output 5.0s).
+    *   **Exact Resolution**: Guarantees output resolution is strictly `Scale × Input` (e.g., 1280x740 → 2560x1480), using reflective padding instead of cropping to prevent pixel loss.
+*   **📝 Concise & Professional Logging**: Optimized console output that filters out internal noise and presents key metrics (Real FPS, Resolution Scaling) cleanly, making it suitable for production monitoring.
 
 ### ⚡ **Original FlashVSR Advantages (Preserved)**
 *   **Real-Time Performance**: Achieves ~17 FPS for 768 × 1408 videos on a single A100 GPU.
@@ -57,8 +61,6 @@ python infer.py -i inputs/input.mp4 -o results/ --mode tiny
 # Long video processing (tiny-long mode)
 python infer.py -i inputs/long_input.mp4 -o results/ --mode tiny-long
 ```
-
----
 
 ## 🚀 Quick Start with Docker (Recommended)
 
@@ -98,6 +100,55 @@ docker run --gpus all -it --rm \
 
 ---
 
+## 🔧 Comprehensive Parameter Reference
+
+### Inference Modes
+*   `--mode`: Inference mode selection.
+    *   `full`: Uses `WanModel` + `WanVideoVAE`. Highest quality but requires significant VRAM (~14GB+ for 2s 720p without tiling).
+    *   `tiny`: Uses `WanModel` + `TCDecoder`. Balanced speed and quality.
+    *   `tiny-long`: Optimized streaming inference for long videos.
+
+### Tiling & Memory Management
+*   `--tile-dit`: Enable tiling for the DiT model. Drastically reduces VRAM usage by processing the latent space in blocks. Essential for high-resolution inference on consumer GPUs.
+    *   `--tile-size`: Tile size in pixels (default: `256`).
+    *   `--overlap`: Overlap between tiles (default: `24`).
+*   `--tile-vae`: Enable tiling for the VAE decoder. Allows decoding very large frames by splitting the latent representation before decoding.
+
+### Output Control
+*   `--fps INTEGER`: Force a specific frame rate for the output video. By default, tries to match input video FPS or uses 30 for image sequences.
+*   `--quality INTEGER`: Output video quality (0-10). Default `10` (High). Maps to FFmpeg CRF values.
+*   `--color-fix`: Enable AdaIN/Wavelet-based post-processing color correction to match input color tones.
+*   `--keep-audio`: Transfer audio track from input to output video.
+
+### Advanced Tuning
+*   `--dtype`: Precision format. Options: `bf16` (default, recommended), `fp16`, `fp32`.
+*   `--device`: Processing device. Default: `cuda`.
+*   `--scale`: Upscaling factor. Default: `2.0`.
+*   `--sparse-ratio`: Controls Attention sparsity. Default: `2.0`. Lower (e.g. 1.5) is faster but potentially less stable.
+*   `--kv-ratio`: KV cache ratio. Default: `3.0`.
+*   `--local-range`: Local attention window size. Default: `11`.
+*   `--seed`: Random seed for reproducibility.
+
+### Key Arguments
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| `-i, --input` | Path to input video or image folder. | **Required** |
+| `-o, --output` | Output directory or file path. | `./results` |
+| `--mode` | Inference mode: `full` (Wan VAE), `tiny` (TCD), `tiny-long`. | `tiny` |
+| `--keep-audio` | Preserve audio from input video (if exists). | `False` |
+| `--tile-dit` | Enable memory-efficient tiled DiT inference. | `False` |
+| `--tile-vae` | Enable tiled decoding for VAE (Full mode only). | `False` |
+| `--tile-size` | Size of each tile when using tiling. | `256` |
+| `--overlap` | Overlap between tiles to reduce seams. | `24` |
+| `--scale` | Super-resolution scale factor. | `2.0` |
+| `--seed` | Random seed for reproducible results. | `0` |
+
+**Note**: The original FlashVSR is primarily designed and tested for 4x super-resolution. While other scales are supported, for optimal quality and stability, using `--scale 4.0` is recommended.
+
+For a full list of arguments, run `python infer.py --help`.
+
+---
+
 ## 🎯 Usage
 
 The main interface is the unified `infer.py` script.
@@ -128,64 +179,32 @@ python infer.py -i inputs/input.mp4 -o ./results/ --mode full --tile-vae
 python infer.py -i inputs/large_input_with_audio.mp4 -o ./results/ --mode full --tile-vae --tile-dit --keep-audio
 ```
 
-### Key Arguments
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `-i, --input` | Path to input video or image folder. | **Required** |
-| `-o, --output` | Output directory or file path. | `./results` |
-| `--mode` | Inference mode: `full` (Wan VAE), `tiny` (TCD), `tiny-long`. | `tiny` |
-| `--keep-audio` | Preserve audio from input video (if exists). | `False` |
-| `--tile-dit` | Enable memory-efficient tiled DiT inference. | `False` |
-| `--tile-vae` | Enable tiled decoding for VAE (Full mode only). | `False` |
-| `--tile-size` | Size of each tile when using tiling. | `256` |
-| `--overlap` | Overlap between tiles to reduce seams. | `24` |
-| `--scale` | Super-resolution scale factor. | `2.0` |
-| `--seed` | Random seed for reproducible results. | `0` |
-
-**Note**: The original FlashVSR is primarily designed and tested for 4x super-resolution. While other scales are supported, for optimal quality and stability, using `--scale 4.0` is recommended.
-
-For a full list of arguments, run `python infer.py --help`.
-
 ---
-
 
 ## ⚡ Performance Optimizations
 
-FlashVSR-Pro includes comprehensive performance enhancements designed for high-throughput production environments and real-time processing requirements.
+FlashVSR-Pro includes comprehensive performance enhancements designed for **high-end GPUs (A100/H100/H200/RTX4090, etc)** and high-throughput production environments.
 
-### Key Optimizations
+### 1. Zero-Copy Pipeline
+*   **Mechanism**: Implements a fully GPU-resident data pipeline. Input frames are read in batches and immediately transferred to VRAM. Resizing, cropping, and normalization all happen on the GPU.
+*   **Benefit**: Eliminates the "CPU -> GPU -> CPU" round-trip bottleneck found in standard implementations. Input tensors stay on the GPU throughout the entire inference lifecycle.
 
-*   **🚀 Optimized Device Transfers**: Merged redundant tensor `.to()` operations into single calls, reducing device transfer overhead by ~50% during data preprocessing and model loading.
-*   **🔇 Suppressed Verbose Outputs**: Automatic redirection of diffsynth library outputs and removal of detailed progress prints during tiled inference, eliminating I/O bottlenecks in high-performance scenarios.
-*   **💾 Streamlined Memory Management**: Removed frequent GPU cache clearing operations and optimized VAE memory usage by eliminating unnecessary encoder components, reducing memory fragmentation.
-*   **⚙️ Code Structure Improvements**: Merged redundant validation checks, cached registry accesses, and optimized pipeline initialization for faster startup times.
+### 2. Hardware Acceleration (Ampere/Hopper)
+*   **TF32 Support**: Explicitly enables TensorFloat-32 (TF32) for Matrix Multiplications and Convolutions on Ampere+ architectures.
+*   **cuDNN Benchmarking**: Activates `torch.backends.cudnn.benchmark = True`, allowing the driver to auto-tune convolution algorithms for the specific input resolution during the first pass.
+*   **Impact**: Significantly boosts raw compute throughput for FP32/BF16 operations without code changes.
 
-### Performance Benefits
+### 3. Asynchronous Execution
+*   **Mechanism**: Removed unnecessary `torch.cuda.synchronize()` calls from the critical inference path.
+*   **Benefit**: Allows the CPU to issue CUDA kernels ahead of execution, fully filling the GPU's instruction pipeline and maximizing utilization rate.
 
-| Optimization Area | Performance Impact | Use Case |
-| :--- | :--- | :--- |
-| **Device Transfers** | ~50% reduction in tensor movement overhead | Large video processing, batch operations |
-| **Output Suppression** | Eliminates I/O blocking during inference | Real-time streaming, production deployment |
-| **Memory Management** | Reduced GPU memory fragmentation | Long-running processes, high-resolution videos |
-| **Code Optimization** | Faster initialization and validation | Frequent script execution, automated workflows |
+### 4. Efficient I/O
+*   **Mechanism**: Bypasses the standard PIL (Python Imaging Library) conversion stack. The pipeline returns raw Numpy arrays directly to the video encoder (FFmpeg).
+*   **Benefit**: Saves thousands of CPU cycles per second by avoiding "Tensor -> Numpy -> PIL Image -> Numpy -> FFmpeg" conversion chains.
 
-### Recommended Settings for Production Use
-
-```bash
-# High-performance configuration for production use (Tiny Mode)
-python infer.py -i inputs/input.mp4 -o results/ \
-  --mode tiny \
-  --tile-dit \
-  --tile-size 256 \
-  --dtype bf16 \
-  --device cuda
-```
-
-**Note**: These settings are particularly beneficial for:
-- Large-scale video processing pipelines
-- Real-time streaming applications
-- Production environments with high throughput requirements
-- Systems with limited I/O bandwidth
+### 5. Hardware-Accelerated Video Encoding (NVENC)
+*   **Mechanism**: Automatically detects and utilizes NVIDIA's NVENC hardware encoder when available. It includes a robust fallback mechanism that performs a functional test of the encoder before usage, ensuring stability even in varied container environments.
+*   **Benefit**: Offloads video compression from the CPU to the GPU's dedicated media engine. This drastically reduces CPU load and I/O latency during the final video saving stage, ensuring that high-throughput inference isn't bottlenecked by disk write speeds.
 
 ---
 

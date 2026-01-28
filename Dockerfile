@@ -1,6 +1,10 @@
 # 1. Use base image that matches server CUDA version (12.8) and includes full development toolchain
 FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
+# Critical: Tell NVIDIA Container Runtime to mount driver libraries for Video Codec SDK (NVENC/NVDEC)
+# Without this, only 'compute' and 'utility' libs are mounted, causing "libnvidia-encode.so not found".
+ENV NVIDIA_DRIVER_CAPABILITIES=align,compute,utility,video
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 2. Install system dependencies
@@ -35,9 +39,7 @@ WORKDIR /workspace/FlashVSR-Pro
 COPY . .
 
 # 7. Create necessary directories for mounted models, VAE variants, and inputs
-RUN mkdir -p /workspace/FlashVSR-Pro/models/FlashVSR \
-    && mkdir -p /workspace/FlashVSR-Pro/models/FlashVSR-v1.1 \
-    && mkdir -p /workspace/FlashVSR-Pro/models/VAEs \
+RUN mkdir -p /workspace/FlashVSR-Pro/models/FlashVSR-v1.1 \
     && mkdir -p /workspace/FlashVSR-Pro/models/prompt_tensor \
     && mkdir -p /workspace/FlashVSR-Pro/inputs \
     && mkdir -p /workspace/FlashVSR-Pro/results
