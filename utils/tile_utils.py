@@ -9,6 +9,7 @@ import numpy as np
 import math
 from typing import List, Tuple, Optional, Generator
 import warnings
+from tqdm import tqdm
 
 def calculate_tile_coords(height: int, width: int, tile_size: int, overlap: int, multiple: int = 32) -> List[Tuple[int, int, int, int]]:
     """
@@ -205,6 +206,7 @@ def apply_tiled_inference_simple(
     LQ_video: torch.Tensor,
     tile_size: int = 256,
     overlap: int = 24,
+    tile_size_vae: tuple = None, # Explicitly accept VAE parameter to avoid kwargs collision
     **pipeline_kwargs
 ) -> torch.Tensor:
     """
@@ -212,6 +214,7 @@ def apply_tiled_inference_simple(
     """
     if tile_size <= 0:
         # No tiling
+        if tile_size_vae is not None: pipeline_kwargs['tile_size'] = tile_size_vae
         return pipeline(**pipeline_kwargs)
     
     # Check input shape
@@ -233,14 +236,38 @@ def apply_tiled_inference_simple(
     output_tiles = []
     
     for idx, (x1, y1, x2, y2) in enumerate(coords):
+        # Print tile inference progress
+        is_streaming = "TinyLong" in type(pipeline).__name__
+        msg = f"Infering tile {idx+1}/{len(coords)}"
+        if is_streaming:
+            msg += " (Streaming"
+            if tile_size_vae is not None:
+                msg += " & VAE-tiled"
+            msg += ")..."
+            # For streaming mode, we rely on the pipeline's internal progress bar,
+            # which we want to be clean (without 'DiT Inference' prefix if user requested)
+            # But here we just set the header message.
+        else:
+            msg += "..."
+            
+        print(msg)
+
         # Extract tile
         tile = LQ_video[:, :, :, y1:y2, x1:x2]
         
         # Update pipeline parameters
         tile_kwargs = pipeline_kwargs.copy()
+        if tile_size_vae is not None:
+            tile_kwargs['tile_size'] = tile_size_vae
         tile_kwargs['LQ_video'] = tile
         tile_kwargs['height'] = y2 - y1
         tile_kwargs['width'] = x2 - x1
+        
+        # Set decoding message, indicating if VAE tiling is also active
+        if tile_size_vae is not None:
+             tile_kwargs['decoding_msg'] = "Decoding video (Tiled)"
+        else:
+             tile_kwargs['decoding_msg'] = "Decoding video"
         
         # Run inference (quiet mode for performance)
         tile_output = pipeline(**tile_kwargs)
@@ -254,9 +281,27 @@ def apply_tiled_inference_simple(
     
     return final_output
 
-def vae_decode_tiled(vae_model, latents: torch.Tensor, tile_size: int = 512, overlap: int = 32):
+def vae_decode_tiled(
+    vae_model, 
+    latents: torch.Tensor, 
+    tile_size: int = 512, 
+    overlap: int = 32, 
+    desc: str = "Decoding video",
+    decode_fn = None,
+    **kwargs
+):
     """
     Tiled processing for VAE decoding
+    
+    Args:
+        vae_model: VAE model with .decode() method (used if decode_fn is None)
+        latents: Input latent tensor
+        tile_size: Tile size for spatial dimension
+        overlap: Overlap size
+        desc: Description for progress bar
+        decode_fn: Optional callable for decoding. If provided, used instead of vae_model.decode.
+                  Crucial for avoiding recursion when monkey-patching.
+        **kwargs: Additional arguments to pass to the decode function (e.g. device)
     """
     if latents.dim() == 4:
         # Image case: add time dimension
@@ -267,11 +312,14 @@ def vae_decode_tiled(vae_model, latents: torch.Tensor, tile_size: int = 512, ove
     else:
         raise ValueError(f"Expected latents with 4 or 5 dimensions, got {latents.dim()}")
     
+    # Determine decoder function
+    decoder = decode_fn if decode_fn is not None else vae_model.decode
+    
     B, C, T, H, W = latents.shape
     
     # If dimensions smaller than tile_size, decode directly
     if H <= tile_size and W <= tile_size:
-        result = vae_model.decode(latents)
+        result = decoder(latents, **kwargs)
         return result.squeeze(2) if is_image else result
     
     # Tiled decoding
@@ -280,12 +328,16 @@ def vae_decode_tiled(vae_model, latents: torch.Tensor, tile_size: int = 512, ove
     # Store tile results
     output_tiles = []
     
-    for idx, (x1, y1, x2, y2) in enumerate(coords):
+    # Always use tqdm so we can show the description (e.g. "Decoding video: 100%|...| 1/1")
+    # This aligns with user request for inline label.
+    pbar = tqdm(coords, desc=desc)
+        
+    for idx, (x1, y1, x2, y2) in enumerate(pbar):
         # Extract tile
         tile = latents[:, :, :, y1:y2, x1:x2]
         
-        # Decode
-        tile_decoded = vae_model.decode(tile)
+        # Decode using the selected decoder function
+        tile_decoded = decoder(tile, **kwargs)
         output_tiles.append(tile_decoded)
     
     # Stitch

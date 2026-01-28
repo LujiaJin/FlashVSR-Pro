@@ -92,17 +92,9 @@ class PixelShuffle3d(nn.Module):
 # Generic NTCHW graph executor (kept; used by decoder)
 # ----------------------------
 
-def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
+def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None, desc=None):
     """
     Apply a sequential model with memblocks to the given input.
-    Args:
-    - model: nn.Sequential of blocks to apply
-    - x: input data, of dimensions NTCHW
-    - parallel: if True, parallelize over timesteps (fast but uses O(T) memory)
-        if False, each timestep will be processed sequentially (slow but uses O(1) memory)
-    - show_progress_bar: if True, enables tqdm progressbar display
-
-    Returns NTCHW tensor of output data.
     """
     assert x.ndim == 5, f"TAEHV operates on NTCHW tensors, but got {x.ndim}-dim tensor"
     N, T, C, H, W = x.shape
@@ -123,7 +115,7 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
     else:
         out = []
         work_queue = [TWorkItem(xt, 0) for t, xt in enumerate(x.reshape(N, T * C, H, W).chunk(T, dim=1))]
-        progress_bar = tqdm(range(T), disable=not show_progress_bar)
+        progress_bar = tqdm(range(T), disable=not show_progress_bar, desc=desc)
         while work_queue:
             xt, i = work_queue.pop(0)
             if i == 0:
@@ -236,68 +228,18 @@ class TAEHV(nn.Module):
         n_f = channels
         self.frames_to_trim = 2**sum((True, True)) - 1  # Default time upscale
 
-        if vae_type == "tae-w2.2":
-            # Special structure for tae-w2.2 checkpoint
-            base_decoder = nn.Sequential(
-                nn.Identity(),  # 0
-                conv(self.latent_channels, 256),  # 1
-                nn.Identity(),  # 2
-                MemBlock(256, 256),  # 3
-                MemBlock(256, 256),  # 4
-                MemBlock(256, 256),  # 5
-                nn.Identity(),  # 6
-                TGrow(256, 1),  # 7
-                conv(256, 128, bias=False),  # 8
-                MemBlock(128, 128),  # 9
-                MemBlock(128, 128),  # 10
-                MemBlock(128, 128),  # 11
-                nn.Identity(),  # 12
-                TGrow(128, 2),  # 13
-                conv(128, 64, bias=False),  # 14
-                MemBlock(64, 64),  # 15
-                MemBlock(64, 64),  # 16
-                MemBlock(64, 64),  # 17
-                nn.Identity(),  # 18
-                TGrow(64, 2),  # 19
-                conv(64, 64, bias=False),  # 20
-                nn.Identity(),  # 21
-                conv(64, self.image_channels),  # 22
-            )
-        elif vae_type == "tae-hv":
-            # LightVAE structure for tae-hv: 4x internal upsample + 2x pixel shuffle = 8x total
-            base_decoder = nn.Sequential(
-                Clamp(), conv(self.latent_channels, n_f[0]), nn.ReLU(inplace=True),
+        # Default structure
+        base_decoder = nn.Sequential(
+            Clamp(), conv(self.latent_channels, n_f[0]), nn.ReLU(inplace=True),
 
-                MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]),
-                nn.Upsample(scale_factor=2),
-                TGrow(n_f[0], 1),
-                conv(n_f[0], n_f[1], bias=False),
+            MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]),
+            nn.Upsample(scale_factor=2),
+            TGrow(n_f[0], 1),
+            conv(n_f[0], n_f[1], bias=False),
 
-                MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]),
-                nn.Upsample(scale_factor=2),
-                TGrow(n_f[1], 2),
-                conv(n_f[1], n_f[2], bias=False),
-
-                MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]),
-                nn.Identity(),
-                TGrow(n_f[2], 2),
-                conv(n_f[2], n_f[3], bias=False),
-
-                nn.ReLU(inplace=True), conv(n_f[3], self.image_channels),
-            )
-        else:
-            # Default structure
-            base_decoder = nn.Sequential(
-                Clamp(), conv(self.latent_channels, n_f[0]), nn.ReLU(inplace=True),
-
-                MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]), MemBlock(n_f[0], n_f[0]),
-                nn.Upsample(scale_factor=2),
-                TGrow(n_f[0], 1),
-                conv(n_f[0], n_f[1], bias=False),
-
-                MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]),
-                nn.Upsample(scale_factor=2),
-                TGrow(n_f[1], 2),
+            MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]), MemBlock(n_f[1], n_f[1]),
+            nn.Upsample(scale_factor=2),
+            TGrow(n_f[1], 2),
                 conv(n_f[1], n_f[2], bias=False),
 
                 MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]), MemBlock(n_f[2], n_f[2]),
@@ -343,7 +285,7 @@ class TAEHV(nn.Module):
                     sd[key] = sd[key][-new_sd[key].shape[0]:]
         return sd
 
-    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
+    def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None, decoding_msg=None):
         """Decode a sequence of frames from latents.
         x: NTCHW latent tensor; returns NTCHW RGB in ~[0, 1].
         """
@@ -379,11 +321,17 @@ class TAEHV(nn.Module):
                     # Pad/Repeat to match expected channels
                     x = torch.cat([x, x], dim=2)
 
-        x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem)
+        x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem, desc=decoding_msg)
 
         if x.shape[2] == 12:
             N, T, C, H, W = x.shape
             x = x.reshape(N * T, C, H, W)
+            
+            # De-interleave channels: (N*T, 12, H, W) -> (N*T, 3, 4, H, W) -> Permute -> (N*T, 3, 4, H, W) -> Flatten
+            # Assumes interleaved layout: R0 G0 B0 R1 G1 B1 ... instead of RRRR GGGG BBBB
+            # LightVAE based TAE often uses interleaved output
+            x = x.view(N * T, 4, 3, H, W).permute(0, 2, 1, 3, 4).reshape(N * T, 12, H, W)
+            
             x = F.pixel_shuffle(x, 2)
             x = x.reshape(N, T, 3, H * 2, W * 2)
 

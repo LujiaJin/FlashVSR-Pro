@@ -82,22 +82,24 @@ class Upsample(nn.Upsample):
 
 class Resample(nn.Module):
 
-    def __init__(self, dim, mode):
+    def __init__(self, dim, mode, out_dim=None):
         assert mode in ('none', 'upsample2d', 'upsample3d', 'downsample2d',
                         'downsample3d')
         super().__init__()
         self.dim = dim
         self.mode = mode
+        
+        target_dim = out_dim if out_dim is not None else (dim // 2 if 'upsample' in mode else dim)
 
         # layers
         if mode == 'upsample2d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-                nn.Conv2d(dim, dim // 2, 3, padding=1))
+                nn.Conv2d(dim, target_dim, 3, padding=1))
         elif mode == 'upsample3d':
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2., 2.), mode='nearest-exact'),
-                nn.Conv2d(dim, dim // 2, 3, padding=1))
+                nn.Conv2d(dim, target_dim, 3, padding=1))
             self.time_conv = CausalConv3d(dim,
                                           dim * 2, (3, 1, 1),
                                           padding=(1, 0, 0))
@@ -388,7 +390,8 @@ class Decoder3d(nn.Module):
                  attn_scales=[],
                  temperal_upsample=[False, True, True],
                  dropout=0.0,
-                 out_channels=3):
+                 out_channels=3,
+                 use_channel_halving_upsample=True):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -396,6 +399,7 @@ class Decoder3d(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.attn_scales = attn_scales
         self.temperal_upsample = temperal_upsample
+        self.use_channel_halving_upsample = use_channel_halving_upsample
 
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
@@ -413,7 +417,7 @@ class Decoder3d(nn.Module):
         upsamples = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             # residual (+attention) blocks
-            if i == 1 or i == 2 or i == 3:
+            if self.use_channel_halving_upsample and (i == 1 or i == 2 or i == 3):
                 in_dim = in_dim // 2
             for _ in range(num_res_blocks + 1):
                 upsamples.append(ResidualBlock(in_dim, out_dim, dropout))
@@ -424,7 +428,9 @@ class Decoder3d(nn.Module):
             # upsample block
             if i != len(dim_mult) - 1:
                 mode = 'upsample3d' if temperal_upsample[i] else 'upsample2d'
-                upsamples.append(Resample(out_dim, mode=mode))
+                
+                resample_out_dim = out_dim // 2 if self.use_channel_halving_upsample else out_dim
+                upsamples.append(Resample(out_dim, mode=mode, out_dim=resample_out_dim))
                 scale *= 2.0
         self.upsamples = nn.Sequential(*upsamples)
 
@@ -503,7 +509,10 @@ class VideoVAE_(nn.Module):
                  temperal_downsample=[False, True, True],
                  dropout=0.0,
                  input_channels=3,
-                 output_channels=3):
+                 output_channels=3,
+                 encoder_dim=None,
+                 decoder_dim=None,
+                 use_channel_halving_upsample=True):
         super().__init__()
         self.dim = dim
         self.z_dim = z_dim
@@ -512,14 +521,19 @@ class VideoVAE_(nn.Module):
         self.attn_scales = attn_scales
         self.temperal_downsample = temperal_downsample
         self.temperal_upsample = temperal_downsample[::-1]
+        
+        # Determine separate dimensions
+        enc_dim = encoder_dim if encoder_dim is not None else dim
+        dec_dim = decoder_dim if decoder_dim is not None else dim
 
         # modules
-        self.encoder = Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks,
+        self.encoder = Encoder3d(enc_dim, z_dim * 2, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_downsample, dropout, in_channels=input_channels)
         self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
-        self.decoder = Decoder3d(dim, z_dim, dim_mult, num_res_blocks,
-                                 attn_scales, self.temperal_upsample, dropout, out_channels=output_channels)
+        self.decoder = Decoder3d(dec_dim, z_dim, dim_mult, num_res_blocks,
+                                 attn_scales, self.temperal_upsample, dropout, out_channels=output_channels,
+                                 use_channel_halving_upsample=use_channel_halving_upsample)
 
     def forward(self, x):
         mu, log_var = self.encode(x)
@@ -632,7 +646,7 @@ class VideoVAE_(nn.Module):
 
 class WanVideoVAE(nn.Module):
 
-    def __init__(self, z_dim=16, dim=96, input_channels=3, output_channels=3):
+    def __init__(self, z_dim=16, dim=96):
         super().__init__()
 
         mean = [
@@ -648,7 +662,7 @@ class WanVideoVAE(nn.Module):
         self.scale = [self.mean, 1.0 / self.std]
 
         # init model
-        self.model = VideoVAE_(z_dim=z_dim, dim = dim, input_channels=input_channels, output_channels=output_channels).eval().requires_grad_(False)
+        self.model = VideoVAE_(z_dim=z_dim, dim = dim).eval().requires_grad_(False)
         self.upsampling_factor = 8
 
     def decode_video(self, x, parallel=True, show_progress_bar=False, cond=None):
@@ -696,7 +710,7 @@ class WanVideoVAE(nn.Module):
         return mask
 
 
-    def tiled_decode(self, hidden_states, device, tile_size, tile_stride):
+    def tiled_decode(self, hidden_states, device, tile_size, tile_stride, decoding_msg=None):
         _, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
@@ -717,7 +731,8 @@ class WanVideoVAE(nn.Module):
         weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
         values = torch.zeros((1, 3, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
 
-        for h, h_, w, w_ in tqdm(tasks, desc="VAE decoding"):
+        # Use tqdm, with customized description if provided
+        for h, h_, w, w_ in tqdm(tasks, desc=decoding_msg if decoding_msg else None):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
             hidden_states_batch = self.model.decode(hidden_states_batch, self.scale).to(data_device)
 
@@ -829,15 +844,22 @@ class WanVideoVAE(nn.Module):
         return hidden_states
 
 
-    def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+    def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16), decoding_msg=None):
         hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
         videos = []
         for hidden_state in hidden_states:
             hidden_state = hidden_state.unsqueeze(0)
             if tiled:
-                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride)
+                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride, decoding_msg=decoding_msg)
             else:
-                video = self.single_decode(hidden_state, device)
+                # If not using internal VAE tiling (but maybe the input is already a tile)
+                # We show a single-step progress bar if decoding_msg is provided, to satisfy user request
+                if decoding_msg:
+                    with tqdm(total=1, desc=decoding_msg) as pbar:
+                        video = self.single_decode(hidden_state, device)
+                        pbar.update(1)
+                else:
+                    video = self.single_decode(hidden_state, device)
             video = video.squeeze(0)
             videos.append(video)
         videos = torch.stack(videos)
@@ -1009,85 +1031,5 @@ class LightVideoVAE_(nn.Module):
             self._enc_feat_map = [None] * self._enc_conv_num
 
 
-class Wan22VideoVAE(nn.Module):
-    """
-    Wan2.2 Video VAE - Updated normalization statistics for the
-    improved Wan2.2 training regime. Architecture is compatible with
-    Wan2.1 VAE weights with automatic fallback.
-    """
 
-    def __init__(self, z_dim=16, dim=96, input_channels=3, output_channels=3):
-        super().__init__()
-
-        # Wan2.2 updated normalization statistics
-        # These are optimized for the expanded Wan2.2 training dataset
-        mean = [
-            -0.7524, -0.7052, -0.9088, 0.1098, -0.1712, 0.9681, -0.1489, 1.5534,
-            0.4168, -0.0692, 0.5549, -0.3601, -0.1894, -0.9469, 0.2531, -0.2893
-        ]
-        std = [
-            2.8256, 1.4589, 2.3342, 2.6625, 1.2248, 1.7762, 2.6118, 2.0809,
-            3.2754, 2.1593, 2.8719, 1.5632, 1.6435, 1.1305, 2.8318, 1.9213
-        ]
-        self.mean = torch.tensor(mean)
-        self.std = torch.tensor(std)
-        self.scale = [self.mean, 1.0 / self.std]
-
-        # Fallback to Wan2.1 stats for compatibility
-        self._wan21_mean = torch.tensor([
-            -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-            0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-        ])
-        self._wan21_std = torch.tensor([
-            2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-        ])
-
-        # init model - same architecture as Wan2.1
-        self.model = VideoVAE_(z_dim=z_dim, dim=dim, input_channels=input_channels, output_channels=output_channels).eval().requires_grad_(False)
-        self.upsampling_factor = 8
-        self.vae_type = "wan2.2"
-
-    def forward(self, x):
-        return self.model(x)
-
-    def encode(self, x):
-        return self.model.encode(x, self.scale)
-
-    def decode(self, z):
-        return self.model.decode(z, self.scale)
-
-    def stream_decode(self, z):
-        return self.model.stream_decode(z, self.scale)
-
-    def sample(self, x, deterministic=False):
-        return self.model.sample(x, deterministic)
-
-    def clear_cache(self):
-        self.model.clear_cache()
-
-class LightX2VVAE(WanVideoVAE):
-    def __init__(self, z_dim=16, dim=64, use_full_arch=False):
-        nn.Module.__init__(self)
-
-        mean = [
-            -0.7548, -0.7070, -0.9100, 0.1086, -0.1728, 0.9667, -0.1503, 1.5521,
-            0.4151, -0.0703, 0.5533, -0.3616, -0.1908, -0.9483, 0.2517, -0.2907
-        ]
-        std = [
-            2.8220, 1.4565, 2.3308, 2.6591, 1.2222, 1.7735, 2.6085, 2.0776,
-            3.2720, 2.1559, 2.8685, 1.5605, 1.6408, 1.1279, 2.8284, 1.9186
-        ]
-        self.mean = torch.tensor(mean)
-        self.std = torch.tensor(std)
-        self.scale = [self.mean, 1.0 / self.std]
-
-        # Initialize model
-        if use_full_arch:
-            self.model = VideoVAE_(z_dim=z_dim, dim=96).eval().requires_grad_(False)
-        else:
-            self.model = LightVideoVAE_(z_dim=z_dim, dim=dim).eval().requires_grad_(False)
-
-        self.upsampling_factor = 8
-        self.vae_type = "lightx2v"
 

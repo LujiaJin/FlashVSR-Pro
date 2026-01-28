@@ -164,16 +164,6 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
 
-        print(r"""
-███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗           ██████╗ █████╗   ██████╗ 
-██╔════╝██║     ██╔══██╗██╔════╝██║  ██║██║   ██║██╔════╝██╔══██╗         ██╔══██╗██╔══██╗██╔═══██╗
-█████╗  ██║     ███████║███████╗███████║╚██╗ ██╔╝███████╗███████║ ██████╗ ██████╔╝███████║██║   ██║
-██╔══╝  ██║     ██╔══██║╚════██║██╔══██║ ╚████╔╝ ╚════██║██╔═██║  ╚═════╝ ██╔═══╝ ██╔═██║ ██║   ██║ 
-██║     ███████╗██║  ██║███████║██║  ██║  ╚██╔╝  ███████║██║  ██║         ██║     ██║  ██║╚██████╔╝
-╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝         ╚═╝     ╚═╝  ╚═╝ ╚═════╝ 
-                    ⚡FlashVSR-Pro: Enhanced Real-Time Video Super-Resolution
-""")
-
     def enable_vram_management(self, num_persistent_param_in_dit=None):
         # 仅管理 dit / vae
         dtype = next(iter(self.dit.parameters())).dtype
@@ -274,7 +264,11 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16), decoding_msg=None):
+        if decoding_msg:
+            print(decoding_msg)
+        else:
+            print("Decoding video...")
         frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
 
@@ -306,6 +300,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        decoding_msg = None,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -349,7 +344,17 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         frames_total = []
 
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num)):
+            # If tiled (controlled by simple_tiled_inference which calls this), we might want less verbose progress
+            # But here we just follow user preference. 
+            # Note: User requested "100%|..." without "DiT Inference:" for streaming tiling.
+            # But for standard non-tiled usage, a description is nice.
+            # We can check if 'tiled' arg is True. The pipeline has 'tiled' arg.
+            if tiled:
+                pbar_desc = None # Clean bar for tiled streaming mode
+            else:
+                pbar_desc = "DiT Inference (Streaming)"
+
+            for cur_process_idx in tqdm(range(process_total_num), desc=pbar_desc):
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)

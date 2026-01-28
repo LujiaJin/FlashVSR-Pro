@@ -3,8 +3,8 @@
 FlashVSR utility modules
 """
 
-# Core utilities
-from .core.utils import (
+# Utilities
+from .utils import (
     RMS_norm,
     CausalConv3d,
     PixelShuffle3d,
@@ -12,10 +12,10 @@ from .core.utils import (
     Causal_LQ4x_Proj,
 )
 
-from .core.TCDecoder import build_tcdecoder
+from .TCDecoder import build_tcdecoder
 
-# VAE system
-from .vae import vae_system
+# VAE manager
+from . import vae_manager
 
 # Audio and tiling utilities will be imported dynamically when used
 # Avoid forcing dependencies

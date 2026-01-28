@@ -11,8 +11,8 @@ from typing import Dict, Optional, Union, Any
 import warnings
 import os
 
-from ..core.TCDecoder import build_tcdecoder, TAEW2_1DiffusersWrapper, TAEHV
-from ..processing.tile_utils import vae_decode_tiled
+from utils.TCDecoder import build_tcdecoder, TAEW2_1DiffusersWrapper, TAEHV
+from utils.tile_utils import vae_decode_tiled
 
 
 class VAESystem:
@@ -24,40 +24,16 @@ class VAESystem:
     VAE_CONFIGS = {
         "wan2.1": {
             "class": "WanVAE",
-            "default_path": "models/VAEs/Wan2.1_VAE.pth",
+            "default_path": "models/FlashVSR-v1.1/Wan2.1_VAE.pth",
             "is_tcdecoder": False,
-            "description": "Original Wan VAE 2.1 - High quality, moderate VRAM"
-        },
-        "wan2.2": {
-            "class": "WanVAE",
-            "default_path": "models/VAEs/Wan2.2_VAE.pth",
-            "is_tcdecoder": False,
-            "description": "Wan VAE 2.2 - Best quality, highest VRAM"
-        },
-        "light": {
-            "class": "WanVAE",
-            "default_path": "models/VAEs/lightvaew2_1.pth",
-            "is_tcdecoder": False,
-            "description": "Lightweight Wan VAE - Reduced VRAM for high-res"
+            "description": "High Quality, High VRAM. Ideal for quality-critical tasks"
         },
         "tcd": {
             "class": "TAEW2_1DiffusersWrapper",
-            "default_path": None,
+            "default_path": "models/FlashVSR-v1.1/TCDecoder.ckpt",
             "channels": [512, 256, 128, 128],
             "is_tcdecoder": True,
-            "description": "Tiny Conditional Decoder - Fastest with moderate quality"
-        },
-        "tae-hv": {
-            "class": "LightX2VVAE",
-            "default_path": "models/VAEs/lighttaehy1_5.pth",
-            "is_tcdecoder": False,
-            "description": "Light TAE-HV - Good quality/VRAM balance for video"
-        },
-        "tae-w2.2": {
-            "class": "LightX2VVAE",
-            "default_path": "models/VAEs/taew2_2.safetensors",
-            "is_tcdecoder": False,
-            "description": "TAE W2.2 - Improved TAE-HV variant"
+            "description": "Balanced Quality, Lower VRAM. Ideal for efficient real-time processing"
         }
     }
 
@@ -70,7 +46,7 @@ class VAESystem:
 
     def load_vae(self,
                  vae_type: str = "wan2.1",
-                 custom_path: Optional[str] = None,
+                 weight_path: Optional[str] = None,
                  mode: str = "full",
                  tile_vae: bool = False,
                  tile_size: int = 512,
@@ -79,21 +55,27 @@ class VAESystem:
         """Load specified VAE model."""
         vae_type = vae_type.lower()
         if vae_type not in self.VAE_CONFIGS:
-            raise ValueError(
-                f"Unsupported VAE type: '{vae_type}'. "
-                f"Available: {list(self.VAE_CONFIGS.keys())}"
-            )
+             # Fallback logic if needed or raise error
+             if mode == 'full':
+                 vae_type = 'wan2.1'
+             else:
+                 vae_type = 'tcd'
+             
+             if vae_type not in self.VAE_CONFIGS: # Should not happen
+                raise ValueError(
+                    f"Unsupported VAE type: '{vae_type}'. "
+                    f"Available: {list(self.VAE_CONFIGS.keys())}"
+                )
 
         config = self.VAE_CONFIGS[vae_type]
         self.current_type = vae_type
 
         # Determine weight path
-        if custom_path:
-            weight_path = custom_path
-        elif config["default_path"]:
-            weight_path = config["default_path"]
-        else:
-            weight_path = os.path.join(model_dir, "TCDecoder.ckpt")
+        if weight_path is None:
+             if config["default_path"]:
+                weight_path = config["default_path"]
+             else:
+                weight_path = None # tcd has no weight path
 
         if weight_path and not os.path.exists(weight_path):
             warnings.warn(
@@ -101,7 +83,7 @@ class VAESystem:
                 f"Model '{vae_type}' may not load correctly."
             )
 
-        print(f"Loading VAE: {vae_type}")
+        # print(f"Loading VAE: {vae_type}")
 
         # Load model based on type
         if config["is_tcdecoder"]:
@@ -115,7 +97,7 @@ class VAESystem:
         if tile_vae and hasattr(vae_model, 'decode'):
             self._wrap_decode_for_tiling(tile_size, overlap)
 
-        print(f"VAE ready: {config['description']}")
+        # print(f"VAE ready: {config['description']}")
 
         return vae_model
 
@@ -162,12 +144,43 @@ class VAESystem:
 
         original_decode = self.current_vae.decode
 
-        def tiled_decode(latents):
+        def tiled_decode(latents, **kwargs):
+            # Extract desc/decoding_msg if present to pass as 'desc' to vae_decode_tiled
+            # The pipeline passes 'decoding_msg' in kwargs
+            desc = kwargs.get("decoding_msg", "VAE Decoding")
+            
+            # Prioritize runtime parameters from pipeline (Latent Space) if present
+            # Pipeline passes 'tile_size' (tuple) and 'tile_stride' (tuple)
+            rt_tile_size = kwargs.pop('tile_size', None)
+            rt_tile_stride = kwargs.pop('tile_stride', None)
+            rt_overlap = kwargs.pop('overlap', None)
+            
+            # Determine effective tile_size (int calling for tile_utils)
+            if rt_tile_size is not None:
+                final_tile_size = rt_tile_size[0] if isinstance(rt_tile_size, (tuple, list)) else rt_tile_size
+            else:
+                final_tile_size = tile_size # Fallback to closure (Configured Pixel Size?)
+
+            # Determine effective overlap
+            if rt_tile_stride is not None:
+                stride_val = rt_tile_stride[0] if isinstance(rt_tile_stride, (tuple, list)) else rt_tile_stride
+                final_overlap = final_tile_size - stride_val
+            elif rt_overlap is not None:
+                final_overlap = rt_overlap
+            else:
+                final_overlap = overlap
+
+            # Disable nested tiling for the inner decoder calls
+            kwargs['tiled'] = False
+            
             return vae_decode_tiled(
                 self.current_vae,
                 latents,
-                tile_size=tile_size,
-                overlap=overlap
+                tile_size=final_tile_size,
+                overlap=final_overlap,
+                desc=desc,
+                decode_fn=original_decode, # Pass original decode to avoid recursion
+                **kwargs # Pass remaining arguments (like device) to decoder
             )
 
         self.current_vae.decode = tiled_decode
@@ -206,7 +219,7 @@ class VAESystem:
 # -------------------------
 
 class WanVAELoader:
-    """Specialized loader for Wan VAE models (wan2.1, wan2.2, lightvae)"""
+    """Specialized loader for Wan VAE models (wan2.1)"""
 
     @staticmethod
     def load_vae(weight_path: str, vae_type: str) -> nn.Module:
@@ -238,28 +251,13 @@ class WanVAELoader:
             raise ValueError(f"No decoder found in {vae_type} weights")
 
         # Create WanVideoVAE instance
-        from diffsynth.models.wan_video_vae import WanVideoVAE, LightX2VVAE, Wan22VideoVAE
+        from diffsynth.models.wan_video_vae import WanVideoVAE
 
-        # Different VAE types may have different dimensions
-        if vae_type == 'light':
-            # LightVAE has smaller dimensions
-            vae_model = WanVideoVAE(z_dim=16, dim=24)
-        elif vae_type == 'wan2.2':
-            # Wan2.2 has larger dimensions for better quality
-            # Dim is 160 based on weight shape [160, 12, 3, 3, 3]
-            # Channels 12 based on weight shape
-            vae_model = Wan22VideoVAE(z_dim=16, dim=160, input_channels=12, output_channels=12)
-        elif vae_type in ['tae-hv', 'tae-w2.2']:
-            # Use LightX2VVAE for tae models
-            # Assuming tae-hv and tae-w2.2 maps to using LightX2VVAE
-            vae_model = LightX2VVAE(z_dim=16, dim=64, use_full_arch=False)
-        else:
-            # Standard Wan VAE
-            vae_model = WanVideoVAE(z_dim=16, dim=96)
+        # Standard Wan VAE
+        vae_model = WanVideoVAE(z_dim=16, dim=96)
 
         # Add 'model.' prefix to match WanVideoVAE state_dict keys
         state_dict = {f"model.{k}": v for k, v in state_dict.items()}
-
         # Load state dict
         missing, unexpected = vae_model.load_state_dict(state_dict, strict=False)
 
@@ -267,69 +265,6 @@ class WanVAELoader:
             warnings.warn(f"Missing keys in {vae_type}: {missing[:3]}...")
         if unexpected:
             warnings.warn(f"Unexpected keys in {vae_type}: {unexpected[:3]}...")
-
-        return vae_model
-
-
-class TAEVAELoader:
-    """Specialized loader for TAE VAE models (tae-hv, tae-w2.2)"""
-
-    @staticmethod
-    def load_vae(weight_path: str, vae_type: str, channels: list = None) -> nn.Module:
-        """Load TAE VAE with proper decoder structure"""
-        if not weight_path or not os.path.exists(weight_path):
-            raise FileNotFoundError(f"VAE weights not found: {weight_path}")
-
-        if channels is None:
-            channels = [256, 128, 64, 64]  # Default for tae-hv/tae-w2.2
-
-        # Load checkpoint
-        if weight_path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            full_state_dict = load_file(weight_path, device='cpu')
-        else:
-            checkpoint = torch.load(weight_path, map_location='cpu', weights_only=False)
-            if 'state_dict' in checkpoint:
-                full_state_dict = checkpoint['state_dict']
-            elif isinstance(checkpoint, dict):
-                full_state_dict = checkpoint
-            else:
-                raise ValueError("Cannot extract state_dict from checkpoint")
-
-        # Extract decoder weights only (TAE models contain encoder + decoder)
-        decoder_state_dict = {}
-        for key, value in full_state_dict.items():
-            if key.startswith('decoder.'):
-                decoder_state_dict[key] = value
-
-        if not decoder_state_dict:
-            raise ValueError(f"No decoder weights found in {vae_type}")
-
-        # Determine output channels and latent channels based on vae_type
-        if vae_type == "tae-hv":
-            output_channels = 12
-            latent_channels = 32
-        elif vae_type == "tae-w2.2":
-            output_channels = 12
-            latent_channels = 48
-        else:
-            output_channels = 3
-            latent_channels = 32
-
-        # Create TAEW2_1DiffusersWrapper with correct structure
-        vae_model = TAEW2_1DiffusersWrapper(pretrained_path=None, channels=channels, output_channels=output_channels)
-
-        # Set correct latent channels for TAE models
-        vae_model.taehv.latent_channels = latent_channels
-
-        # Rebuild decoder to match checkpoint structure (no additional deepening)
-        vae_model.taehv._rebuild_decoder(channels, latent_channels, vae_type)
-
-        # Load decoder weights
-        missing, unexpected = vae_model.taehv.load_state_dict(decoder_state_dict, strict=True)
-
-        if missing or unexpected:
-            raise RuntimeError(f"TAE weight loading failed - missing: {len(missing)}, unexpected: {len(unexpected)}")
 
         return vae_model
 
@@ -427,12 +362,6 @@ class VAELoaderFactory:
     LOADERS = {
         # Wan series
         "wan2.1": WanVAELoader,
-        "wan2.2": WanVAELoader,
-        "light": WanVAELoader,
-
-        # TAE series
-        "tae-hv": WanVAELoader, # Changed from TAEVAELoader to WanVAELoader
-        "tae-w2.2": WanVAELoader, # Changed from TAEVAELoader to WanVAELoader
 
         # TCD series
         "tcd": TCDVAELoader,

@@ -284,8 +284,36 @@ class FlashVSRFullPipeline(BasePipeline):
         latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16), decoding_msg=None):
+        # Always try to pass decoding_msg to the VAE
+        # We assume the VAE (mostly WanVideoVAE) has been updated to accept this argument.
+        
+        if not decoding_msg:
+             decoding_msg = "Decoding video"
+
+        decode_kwargs = {
+            "device": self.device,
+            "tiled": tiled,
+            "tile_size": tile_size,
+            "tile_stride": tile_stride,
+            "decoding_msg": decoding_msg
+        }
+
+        try:
+            frames = self.vae.decode(latents, **decode_kwargs)
+        except TypeError as e:
+            # Fallback for VAEs that don't accept decoding_msg
+            if "unexpected keyword argument 'decoding_msg'" in str(e):
+                decode_kwargs.pop("decoding_msg")
+                # Print manually since VAE won't handle the description
+                if decoding_msg:
+                    print(decoding_msg)
+                else:
+                    print("Decoding video...")
+                frames = self.vae.decode(latents, **decode_kwargs)
+            else:
+                raise e
+                
         return frames
 
     @torch.no_grad()
@@ -316,6 +344,7 @@ class FlashVSRFullPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        decoding_msg = None,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -356,7 +385,7 @@ class FlashVSRFullPipeline(BasePipeline):
         self.vae.clear_cache()
 
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num)):
+            for cur_process_idx in tqdm(range(process_total_num), desc="DiT Inference"):
                 torch.cuda.synchronize()
                 dit_time_start = time.time()
 
@@ -421,6 +450,7 @@ class FlashVSRFullPipeline(BasePipeline):
             latents = torch.cat(latents_total, dim=2)
 
             # Decode
+            tiler_kwargs["decoding_msg"] = decoding_msg
             frames = self.decode_video(latents, **tiler_kwargs)
 
             # 颜色校正（wavelet）

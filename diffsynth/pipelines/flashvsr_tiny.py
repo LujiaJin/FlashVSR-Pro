@@ -264,9 +264,158 @@ class FlashVSRTinyPipeline(BasePipeline):
         latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16), decoding_msg=None):
+        if not decoding_msg:
+             decoding_msg = "Decoding video"
+        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride, decoding_msg=decoding_msg)
         return frames
+
+    def _build_1d_mask(self, length, left_bound, right_bound, border_width):
+        x = torch.ones((length,))
+        if not left_bound:
+            x[:border_width] = (torch.arange(border_width) + 1) / border_width
+        if not right_bound:
+            x[-border_width:] = torch.flip((torch.arange(border_width) + 1) / border_width, dims=(0,))
+        return x
+
+    def _build_mask(self, data, is_bound, border_width):
+        _, _, _, H, W = data.shape
+        h = self._build_1d_mask(H, is_bound[0], is_bound[1], border_width[0])
+        w = self._build_1d_mask(W, is_bound[2], is_bound[3], border_width[1])
+
+        h = h.view(H, 1).expand(H, W)
+        w = w.view(1, W).expand(H, W)
+
+        mask = torch.stack([h, w]).min(dim=0).values
+        mask = mask.view(1, 1, 1, H, W)
+        return mask
+
+    def _tiled_decode(self, latents, cond, tile_size, tile_stride, decoding_msg):
+        # latents: (B, C, F, H, W)
+        # cond: (B, C, F, H_c, W_c)
+        
+        device = self.device
+        dtype = latents.dtype
+        B, C, F, H, W = latents.shape
+        _, _, _, H_c, W_c = cond.shape
+        
+        # Determine upscale factor for VAE (Latent -> Output)
+        vae_upscale = 8 # WanVideoVAE default
+        out_H, out_W = H * vae_upscale, W * vae_upscale
+        
+        # Determine scale factor for Cond (Latent -> Cond)
+        # Assuming cond is 8x latent size (standard for WanVideoVAE 8x downsample)
+        # PixelShuffle3d(4, 8, 8) reduces Cond by 8x spatially to match Latent
+        cond_scale = 8
+        
+        # Prepare Output Accumulator
+        # Output is [-1, 1] range from TCDecoder, we accumulate directly?
+        # We need float32 accumulator for precision
+        # TCDecoder temporal upsampling: F_latent -> F_latent * 4 - 3 (typically)
+        # We use dimensions from cond (LQ_video) if available, as they should match target output
+        out_F = cond.shape[2] 
+        # Fallback if cond not consistent: out_F = F * 4 - 3
+        
+        value = torch.zeros((B, 3, out_F, out_H, out_W), device="cpu", dtype=torch.float32)
+        count = torch.zeros((B, 1, out_F, out_H, out_W), device="cpu", dtype=torch.float32)
+        
+        # Define Tiles
+        # tile_size and tile_stride are in Latent Space
+        ts_h, ts_w = tile_size
+        st_h, st_w = tile_stride
+        
+        tasks = []
+        for h in range(0, H, st_h):
+            if (h-st_h >= 0 and h-st_h+ts_h >= H): continue
+            for w in range(0, W, st_w):
+                if (w-st_w >= 0 and w-st_w+ts_w >= W): continue
+                tasks.append((h, w))
+        
+        if not decoding_msg:
+             decoding_msg = "Decoding video (Tiled)"
+             
+        for (h, w) in tqdm(tasks, desc=decoding_msg):
+            self.TCDecoder.clean_mem()
+            
+            # Tile coordinates in Latent Space
+            h_end = min(h + ts_h, H)
+            w_end = min(w + ts_w, W)
+            
+            # 1. Crop Latents
+            lat_tile = latents[:, :, :, h:h_end, w:w_end].to(device)
+            
+            # 2. Crop Cond
+            # Calculate cond coordinates
+            hc, wc = h * cond_scale, w * cond_scale
+            hc_end, wc_end = h_end * cond_scale, w_end * cond_scale
+            
+            # Ensure cond crop is within bounds (though it should be if ratio is correct)
+            hc_end = min(hc_end, H_c)
+            wc_end = min(wc_end, W_c)
+            
+            cond_tile = cond[:, :, :, hc:hc_end, wc:wc_end].to(device)
+            
+            # 3. Decode
+            # TCDecoder.decode_video expects latents (B, F, C, H, W)
+            frames_tile = self.TCDecoder.decode_video(
+                lat_tile.transpose(1, 2),
+                parallel=False,
+                show_progress_bar=False,
+                cond=cond_tile,
+                decoding_msg=None
+            ) # returns (B, F, C, H, W) in [0, 1] usually? 
+            # Wait, standard TCDecoder returns [0, 1]? 
+            # TCDecoder `decode_video` output:
+            # "returns NTCHW RGB in ~[0, 1]"
+            # BUT in `__call__` originally: `... .transpose(1, 2).mul_(2).sub_(1)`
+            # So `__call__` expects [0, 1] output from decode_video and converts to [-1, 1] for later processing (ColorCorrector)?
+            # ColorCorrector expects inputs.
+            # `frames` returned by `__call__` are usually [-1, 1]?
+            # Let's check `__call__` return logic.
+            # `return frames[0]`.
+            # Typically DiffSynth pipelines return [-1, 1] tensors?
+            # Or [0, 1]?
+            # ColorCorrector input `lq_image`?
+            
+            # Let's match existing `__call__` logic.
+            # Existing: `frames = self.TCDecoder.decode_video(...).transpose(1, 2).mul_(2).sub_(1)`
+            # So `decode_video` returns [0, 1]. `frames` becomes [-1, 1].
+            # Then ColorCorrector is applied.
+            
+            # So here: frames_tile is [0, 1], (B, F, 3, H, W).
+            # Convert to [-1, 1] and (B, 3, F, H, W).
+            frames_tile = frames_tile.transpose(1, 2).mul_(2.0).sub_(1.0)
+            
+            # Ensure time dimension matches accumulator (trim if necessary)
+            if frames_tile.shape[2] > out_F:
+                frames_tile = frames_tile[:, :, :out_F, :, :]
+            
+            # Move to CPU for accumulation
+            frames_tile = frames_tile.to("cpu")
+            
+            # 4. Mask
+            # Using self.vae.build_mask logic
+            # build_mask expects (..., H, W)
+            # Border width in output pixels
+            # Latent border was (ts_h - st_h). Output border is * vae_upscale.
+            border_h = (ts_h - st_h) * vae_upscale
+            border_w = (ts_w - st_w) * vae_upscale
+            
+            mask = self._build_mask(
+                frames_tile,
+                is_bound=(h==0, h+ts_h>=H, w==0, w+ts_w>=W),
+                border_width=(border_h, border_w)
+            ).to(dtype=frames_tile.dtype, device="cpu")
+            
+            # 5. Accumulate
+            oh, ow = h * vae_upscale, w * vae_upscale
+            oh_end = oh + frames_tile.shape[3]
+            ow_end = ow + frames_tile.shape[4]
+            
+            value[:, :, :, oh:oh_end, ow:ow_end] += frames_tile * mask
+            count[:, :, :, oh:oh_end, ow:ow_end] += mask
+            
+        return value / count
 
     @torch.no_grad()
     def __call__(
@@ -282,7 +431,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         cfg_scale=5.0,
         num_inference_steps=50,
         sigma_shift=5.0,
-        tiled=True,
+        tiled=False,
         tile_size=(60, 104),
         tile_stride=(30, 52),
         tea_cache_l1_thresh=None,
@@ -296,6 +445,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        decoding_msg = None,
     ):
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -339,7 +489,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         LQ_cur_idx = 0
 
         with torch.no_grad():
-            for cur_process_idx in tqdm(range(process_total_num)):
+            for cur_process_idx in tqdm(range(process_total_num), desc="DiT Inference"):
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
@@ -403,8 +553,25 @@ class FlashVSRTinyPipeline(BasePipeline):
 
             latents = torch.cat(latents_total, dim=2)
 
-            # Decode
-            frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
+            # Decode: pass decoding_msg to TCDecoder if present to render as progress description
+            # If present, we do NOT print "Decoding video..." manually to avoid newlines.
+            
+            if tiled:
+                frames = self._tiled_decode(
+                    latents,
+                    cond=LQ_video[:,:,:LQ_cur_idx,:,:],
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                    decoding_msg=decoding_msg if decoding_msg else "Decoding video (Tiled)"
+                )
+            else:
+                frames = self.TCDecoder.decode_video(
+                    latents.transpose(1, 2),
+                    parallel=False, 
+                    show_progress_bar=True, 
+                    cond=LQ_video[:,:,:LQ_cur_idx,:,:],
+                    decoding_msg=decoding_msg if decoding_msg else "Decoding video" # If no msg, default to "Decoding video"
+                ).transpose(1, 2).mul_(2).sub_(1)
 
             # 颜色校正（wavelet）
             try:
