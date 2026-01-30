@@ -3,7 +3,7 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 # Critical: Tell NVIDIA Container Runtime to mount driver libraries for Video Codec SDK (NVENC/NVDEC)
 # Without this, only 'compute' and 'utility' libs are mounted, causing "libnvidia-encode.so not found".
-ENV NVIDIA_DRIVER_CAPABILITIES=align,compute,utility,video
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -1,0 +1,19 @@
+# Dockerfile.fastupdate
+# 用于快速更新 FlashVSR-Pro 基础镜像的补丁构建
+# 耗时：几秒钟
+
+# 1. 继承当前已有的镜像（包含已编译好的 CUDA 内核）
+FROM flashvsrpro:latest
+
+# 2. 修正环境变量（移除 align）
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+# 3. 覆盖代码
+# 这里会将当前目录下的所有修改过的 py 文件更新到镜像内
+# 注意：请确保您本地的 .dockerignore 排除掉了 models/ 或 checkpoint 文件，否则镜像会变得很大
+WORKDIR /workspace/FlashVSR-Pro
+COPY . .
+
+# 4. 无需重新运行 pip install
+# 因为原镜像中使用的是 pip install -e .，且 WORKDIR 未改变
+# 所以只要文件覆盖了，Python 环境就会立即生效
