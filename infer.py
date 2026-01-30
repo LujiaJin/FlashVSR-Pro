@@ -62,21 +62,11 @@ except ImportError as e:
         return pipeline(**pipeline_kwargs)
 
 def check_nvenc_support():
-    """Check if NVIDIA NVENC encoder is functionally available in system ffmpeg"""
-    try:
-        # Run functional test: attempt to encode a tiny blank frame
-        # strictly checking if libnvidia-encode can be loaded
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-f', 'rawvideo', '-vcodec', 'rawvideo', 
-            '-s', '32x32', '-pix_fmt', 'rgb24', '-r', '1',
-            '-i', '-', '-c:v', 'h264_nvenc', '-f', 'null', '-'
-        ]
-        # 32*32*3 bytes of zeros
-        dummy_input = b'\x00' * (32 * 32 * 3)
-        
-        # We must use subprocess.run, forcing capture of stderr to check for errors
-        process = subprocess.run(cmd, input=dummy_input, capture_output=True)
+    """
+    Check if NVIDIA NVENC encoder is functionally available in system ffmpeg
+    [JIUTIAN-PRIVATE-BRANCH] Force disabled for stability.
+    """
+    return False
         
         # If return code is 0, it worked. If not, it likely failed to load libs.
         return process.returncode == 0
