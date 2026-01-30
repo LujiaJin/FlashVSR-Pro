@@ -8,8 +8,8 @@ def main():
     parser = argparse.ArgumentParser(description="Process ultra-long videos by chunking")
     parser.add_argument("-i", "--input", required=True, help="Input video path")
     parser.add_argument("-o", "--output_dir", required=True, help="Output directory")
-    parser.add_argument("--segment_time", type=str, default="00:00:60", help="Split segment time (HH:MM:SS), default 5 mins")
-    parser.add_argument("--mode", default="tiny", help="Inference mode")
+    parser.add_argument("--segment_time", type=str, default="30", help="Split segment time (HH:MM:SS), default 5 mins")
+    parser.add_argument("--mode", default="tiny-long", help="Inference mode")
     parser.add_argument("--scale", default="2.0", help="Scale factor")
     
     args = parser.parse_args()
@@ -49,9 +49,16 @@ def main():
     for i, file_path in enumerate(files):
         print(f"Processing chunk {i+1}/{len(files)}: {file_path.name}")
         
-        # Process output will be in processed_dir
-        # We need to calculate where infer.py puts the result based on your logic
-        # But to be safe, we let infer.py output to processed_dir
+        # [FEATURE] Skip Existing
+        # Check if output already exists to resume from crash
+        # We need a predictable output filename pattern to do this accurately.
+        # Assuming infer.py logic: output_{mode}_scale{scale}_{basename}.mp4 ? 
+        # Actually it's complex, so we check using glob like below.
+        existing_candidates = list(processed_dir.glob(f"*{file_path.stem}*.mp4"))
+        if existing_candidates:
+            print(f"[RESUME] Output found for {file_path.name}, skipping inference.")
+            processed_files.append(existing_candidates[0])
+            continue
         
         # Using Tile-DiT is crucial for 1080p chunks
         cmd = [
@@ -66,7 +73,25 @@ def main():
             "--keep-audio" # Always keep audio for chunks so merge works
         ]
         
-        subprocess.run(cmd, check=True)
+        try:
+            subprocess.run(cmd, check=True)
+            
+            # [FEATURE] Explicit GC (Though subprocess exit clears memory, we force OS sync)
+            import gc
+            gc.collect()
+            
+        except subprocess.CalledProcessError as e:
+            print(f"!!! CRASH DETECTED on chunk {file_path.name} (Return code: {e.returncode})")
+            print("!!! Skipping this chunk to continue processing...")
+            # We don't append to processed_files, splitting the list?
+            # Or append None?
+            # If we skip, the final merge will have a gap. 
+            # Better strategy: Append the ORIGINAL chunk (unprocessed) as fallback?
+            # Or just ignore it? 
+            # Let's append the unprocessed chunk (upscaled via ffmpeg later? No, just copy)
+            # Actually, we can't merge resolutions easily. 
+            # So we append NOTHING and warn user that final merge will fail or need manual fix.
+            continue
         
         # Find the result file (assuming infer.py generates only one file in that dir per input)
         # Note: FlashVSR-Pro creates complex filenames, we need to find the latest created file matching input
@@ -74,7 +99,9 @@ def main():
         candidates = list(processed_dir.glob(f"*{file_path.stem}*.mp4"))
         if not candidates:
              print(f"Error: Could not find output for {file_path.name}")
-             exit(1)
+             # exit(1) # Don't exit, just skip
+             continue 
+             
         # Pick the one that looks most like an output (not the input if copied)
         output_chunk = candidates[0]
         processed_files.append(output_chunk)
@@ -83,6 +110,11 @@ def main():
         # file_path.unlink()
 
     print(f"=== Step 3: Merging processed chunks ===")
+    
+    if len(processed_files) != len(files):
+        print(f"!!! WARNING: Processed chunk count {len(processed_files)} != Input chunk count {len(files)}")
+        print("!!! Likely some chunks crashed. Final video will be INCOMPLETE.")
+        print("!!! Please manually re-run failed chunks or inspect results.")
     
     # Create file list for ffmpeg concat
     list_file = work_dir / "concat_list.txt"
