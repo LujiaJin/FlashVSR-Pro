@@ -62,14 +62,69 @@ python infer.py -i inputs/input.mp4 -o results/ --mode tiny
 python infer.py -i inputs/long_input.mp4 -o results/ --mode tiny-long
 ```
 
+## 🖥️ Platform Support
+
+> 📖 **For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md)**
+
+### Supported Platforms
+FlashVSR-Pro is **primarily designed for Linux** systems with NVIDIA GPUs. This is due to:
+
+*   **Block-Sparse-Attention Backend**: The core dependency requires CUDA kernel compilation, which is optimized and extensively tested on Linux.
+*   **Docker Environment**: The recommended installation uses Docker with Ubuntu base image for consistent environment setup.
+*   **CUDA Compilation**: Requires NVIDIA CUDA Toolkit (11.6+) and proper development toolchain, which is more straightforward on Linux.
+
+### Hardware Requirements
+*   **GPU**: NVIDIA GPU with CUDA compute capability 8.0+ (Ampere architecture or newer)
+  *   Recommended: A100, H100, H200, RTX 3090, RTX 4090
+  *   Minimum: RTX 3060, RTX 3070, or similar Ampere/Ada/Hopper GPU
+*   **VRAM**: 
+  *   Minimum 8GB for low-resolution videos with tiling enabled
+  *   16GB+ recommended for high-quality processing
+  *   24GB+ for 4K video processing
+*   **CUDA**: Version 11.6 or higher (12.x recommended)
+*   **System RAM**: 16GB+ recommended
+
+### Windows Users
+While FlashVSR-Pro is optimized for Linux, Windows users have the following options:
+
+1. **Docker Desktop (Recommended for Windows)**
+   *   Install [Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/) with WSL 2 backend
+   *   Install [NVIDIA Container Toolkit for WSL 2](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
+   *   Follow the Docker installation steps below
+   *   This provides a Linux environment within Windows with GPU passthrough
+
+2. **Windows Subsystem for Linux (WSL 2)**
+   *   Install WSL 2 with Ubuntu 22.04
+   *   Install CUDA toolkit in WSL 2
+   *   Follow Linux installation instructions within WSL
+   *   Note: GPU passthrough must be properly configured
+
+3. **Native Windows Installation (Advanced)**
+   *   Requires manual compilation of Block-Sparse-Attention on Windows
+   *   Need Visual Studio 2019+ with C++17 support
+   *   CUDA Toolkit for Windows
+   *   May encounter compatibility issues not tested by maintainers
+   *   Not officially supported - use at your own risk
+
+**Important**: If you've been struggling with installation on Windows, we strongly recommend using Docker Desktop with WSL 2, as this provides the most reliable experience.
+
+---
+
 ## 🚀 Quick Start with Docker (Recommended)
 
-The easiest way to run FlashVSR-Pro is using the provided Docker container, which includes automated setup for the Block-Sparse-Attention backend.
+The easiest way to run FlashVSR-Pro is using the provided Docker container, which includes automated setup for the Block-Sparse-Attention backend. **This is the recommended method for both Linux and Windows (via WSL 2) users.**
 
 ### 1. Prerequisites
+#### For Linux:
 *   Install [Docker](https://docs.docker.com/get-docker/)
 *   Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for GPU support.
 *   Ensure `git-lfs` is installed on your host system to clone model weights.
+
+#### For Windows:
+*   Install [Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/) with WSL 2 backend enabled
+*   Install [NVIDIA CUDA on WSL 2](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
+*   Ensure `git-lfs` is installed: `sudo apt-get install git-lfs` (in WSL Ubuntu terminal)
+*   Run all subsequent commands in WSL 2 Ubuntu terminal
 
 ### 2. Build the Docker Image
 ```bash
@@ -210,23 +265,107 @@ FlashVSR-Pro includes comprehensive performance enhancements designed for **high
 
 ## 🔧 Troubleshooting
 
-### 1. CUDA Out of Memory
+### 1. Platform-Specific Issues
+
+#### Windows Installation Failures
+**Symptom**: Compilation errors, missing CUDA libraries, or general installation failures on Windows.
+
+**Solution**:
+- **Recommended**: Use Docker Desktop with WSL 2 backend (see [Platform Support](#-platform-support) section above)
+- Ensure you're running commands in WSL 2 Ubuntu terminal, not PowerShell or CMD
+- Verify GPU is accessible in WSL: `nvidia-smi` should work in WSL terminal
+- If using native Windows: Ensure Visual Studio 2019+ with C++17 support is installed
+- Check that CUDA Toolkit matches PyTorch CUDA version
+
+#### Linux Permission Errors
+**Symptom**: Docker commands fail with permission errors.
+
+**Solution**:
+- Add your user to docker group: `sudo usermod -aG docker $USER`
+- Log out and back in for changes to take effect
+- Or use `sudo` before docker commands
+
+#### WSL 2 GPU Not Detected
+**Symptom**: `nvidia-smi` fails in WSL or Docker can't access GPU.
+
+**Solution**:
+- Update Windows to latest version (GPU support requires Windows 11 or Windows 10 21H2+)
+- Install latest NVIDIA GPU driver for Windows (not Linux driver)
+- Verify in WSL: `nvidia-smi` should show your GPU
+- Ensure Docker Desktop has WSL 2 integration enabled
+- Check Docker GPU access: `docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi`
+
+### 2. CUDA Out of Memory
 - Use `--tile-dit` and `--tile-vae` to enable tiled inference.
 - Decrease `--tile-size` (e.g., from 256 to 128).
 - Use `--dtype fp16` to reduce memory usage.
+- Process shorter video segments or lower resolution inputs
 
-### 2. Audio Not Preserved
-- Ensure ffmpeg is installed on the host system.
+### 3. Audio Not Preserved
+- Ensure ffmpeg is installed on the host system (or in WSL for Windows users).
 - Check whether the input video contains an audio stream: `ffprobe -i input.mp4`
+- Verify ffmpeg codec support: `ffmpeg -codecs | grep h264`
 
-### 3. Model Loading Fails
+### 4. Model Loading Fails
 - Make sure model weights are downloaded with git-lfs: `git lfs pull`
-- Verify model file integrity
-- Check that weight files are in the correct directory: `./models/`
+- If download is incomplete, files may be text pointers instead of actual weights
+- Verify model file integrity (should be several GB in size)
+- Check that weight files are in the correct directory: `./models/FlashVSR-v1.1/`
+- Ensure git-lfs was installed BEFORE cloning: `git lfs install`
 
-### 4. Block-Sparse-Attention Compilation Errors
+### 5. Block-Sparse-Attention Compilation Errors
 - The Docker build process should handle this automatically. If building manually, ensure you have CUDA 12.1+ and the correct PyTorch version installed.
 - Reference the fix I released in: [mit-han-lab/Block-Sparse-Attention#16](https://github.com/mit-han-lab/Block-Sparse-Attention/pull/16#issue-3800081298)
+- On Windows: Compilation may fail due to missing Visual Studio C++ build tools
+- Check available CUDA architectures match your GPU compute capability
+
+### 6. Performance Issues
+- Ensure you're using CUDA 12.x for best performance
+- Enable TF32: automatically enabled on Ampere+ GPUs
+- Check GPU utilization: `nvidia-smi` should show near 100% during processing
+- Verify you're not CPU-bottlenecked by checking CPU usage
+- Consider using faster storage (SSD) for large video files
+
+---
+
+## ❓ Frequently Asked Questions (FAQ)
+
+### Q: Can I use FlashVSR-Pro on Windows?
+**A**: Yes, but with specific requirements. Windows is not the primary development platform, but you can use FlashVSR-Pro on Windows through:
+1. **Docker Desktop with WSL 2** (Recommended) - Provides Linux environment with GPU access
+2. **WSL 2 directly** - Run Ubuntu in Windows and follow Linux instructions
+3. **Native Windows** (Advanced, not officially supported) - Requires manual compilation
+
+See the [Platform Support](#-platform-support) section for detailed instructions.
+
+### Q: Why does installation fail on Windows?
+**A**: The Block-Sparse-Attention dependency requires CUDA kernel compilation, which is primarily tested on Linux. The Docker/WSL 2 approach avoids these compilation issues by using a pre-configured Linux environment.
+
+### Q: What GPU do I need?
+**A**: You need an NVIDIA GPU with compute capability 8.0 or higher (Ampere generation or newer). Recommended GPUs include:
+- Consumer: RTX 3060, RTX 3070, RTX 3090, RTX 4070, RTX 4090
+- Professional: A100, H100, H200, A6000, RTX 6000 Ada
+
+### Q: Can I use AMD or Intel GPUs?
+**A**: No. FlashVSR-Pro requires NVIDIA GPUs with CUDA support due to the Block-Sparse-Attention kernels being written specifically for NVIDIA CUDA.
+
+### Q: How much VRAM do I need?
+**A**: 
+- Minimum: 8GB with tiling enabled (`--tile-dit --tile-vae`)
+- Recommended: 16GB for 1080p/1440p video processing
+- Optimal: 24GB+ for 4K videos without tiling
+
+### Q: Will this work on macOS?
+**A**: No. FlashVSR-Pro requires NVIDIA CUDA, which is not available on macOS. Apple Silicon (M1/M2/M3) uses different GPU architecture and is not compatible.
+
+### Q: I've been trying to install for weeks, what should I do?
+**A**: We recommend the Docker approach as it handles all dependencies automatically:
+1. Install Docker Desktop (with WSL 2 if on Windows)
+2. Follow the [Quick Start with Docker](#-quick-start-with-docker-recommended) guide
+3. This eliminates most installation issues related to CUDA, compilation, and dependencies
+
+### Q: Can I use this on Google Colab or cloud services?
+**A**: Yes! Cloud platforms with NVIDIA GPUs (Google Colab with T4/A100, AWS with GPU instances, etc.) work well. Use the Docker method or follow Linux installation instructions.
 
 ---
 
