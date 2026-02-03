@@ -63,13 +63,36 @@ except ImportError as e:
 
 def check_nvenc_support():
     """
-    Check if NVIDIA NVENC encoder is functionally available in system ffmpeg
-    [JIUTIAN-PRIVATE-BRANCH] Force disabled for stability.
+    Check if NVIDIA NVENC encoder is available in BOTH:
+    1. imageio_ffmpeg's bundled ffmpeg (used by imageio.get_writer)
+    2. System ffmpeg (used by subprocess fallback)
+    
+    Only returns True if both support h264_nvenc.
     """
-    return False
+    try:
+        # Check imageio_ffmpeg's bundled ffmpeg
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        result_imageio = subprocess.run(
+            [ffmpeg_exe, '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=5
+        )
+        imageio_has_nvenc = 'h264_nvenc' in result_imageio.stdout
         
-        # If return code is 0, it worked. If not, it likely failed to load libs.
-        return process.returncode == 0
+        # Check system ffmpeg
+        result_system = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=5
+        )
+        system_has_nvenc = 'h264_nvenc' in result_system.stdout
+        
+        # Both must support NVENC for consistent behavior
+        if imageio_has_nvenc and system_has_nvenc:
+            return True
+        elif system_has_nvenc and not imageio_has_nvenc:
+            return False
+        else:
+            return False
     except Exception:
         return False
 
@@ -176,26 +199,28 @@ def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quali
     # For NVENC, we use -cq (Constant Quality) and -rc vbr
     
     if NVENC_AVAILABLE:
-        # NVENC settings
+        # NVENC settings - optimized for speed
         vcodec = 'h264_nvenc'
-        # Map quality (0-10) to CQ (35-15 roughly)
-        # Quality 10 -> CQ 15 (High), Quality 0 -> CQ 35 (Low)
-        cq = int(35 - quality * 2)
+        # Map quality (0-10) to CQ (26-20): quality 10 -> CQ 20, quality 0 -> CQ 26
+        cq = int(26 - quality * 0.6)
         encoding_args = [
             '-c:v', vcodec,
-            '-preset', 'p4',      # p4 is "medium" preset for NVENC (good balance)
+            '-preset', 'p1',      # p1 is fastest NVENC preset
             '-rc', 'vbr',
             '-cq', str(cq),
             '-b:v', '0',          # Let VBR handle bitrate
         ]
     else:
-        # CPU x264 settings
+        # CPU x264 settings - optimized for speed and reasonable file size
         vcodec = 'libx264'
-        crf = max(0, 23 - quality * 2) 
+        # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
+        # CRF 20-22 is visually lossless for most content
+        crf = int(26 - quality * 0.6)
         encoding_args = [
             '-c:v', vcodec,
-            '-preset', 'faster',
+            '-preset', 'veryfast',   # Much faster than 'faster', minimal quality loss
             '-crf', str(crf),
+            '-tune', 'film',         # Optimize for high-quality video content
         ]
 
     cmd = [
@@ -255,16 +280,15 @@ def save_video(frames, save_path, fps=30, quality=5):
     try:
         if NVENC_AVAILABLE and format_name == 'FFMPEG':
             # NVENC settings for imageio
-            # Use QP (Constant Quantization) mode as it is most robust across versions
-            # Quality 10 -> QP 20 (High), Quality 0 -> QP 35 (Low)
-            # QP 0 is lossless, 51 is worst.
-            qp = int(35 - quality * 1.5) 
+            # Map quality (0-10) to QP (26-20): quality 10 -> QP 20, quality 0 -> QP 26
+            qp = int(26 - quality * 0.6)
             w = imageio.get_writer(save_path, fps=fps, codec='h264_nvenc', quality=None,
-                                 ffmpeg_params=['-preset', 'p4', '-qp', str(qp), '-pix_fmt', 'yuv420p'])
+                                 pixelformat='yuv420p', ffmpeg_params=['-preset', 'p1', '-qp', str(qp)])
         elif format_name == 'FFMPEG':
-            # Use FFMPEG writer with explicit codec for MP4
-            w = imageio.get_writer(save_path, fps=fps, codec='libx264', quality=quality,
-                                 ffmpeg_params=['-preset', 'faster', '-crf', str(23-quality*2)])
+            # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
+            crf = int(26 - quality * 0.6)
+            w = imageio.get_writer(save_path, fps=fps, codec='libx264', quality=None,
+                                 pixelformat='yuv420p', ffmpeg_params=['-preset', 'veryfast', '-tune', 'film', '-crf', str(crf)])
         elif format_name == 'GIF':
             w = imageio.get_writer(save_path, fps=fps, format='GIF')
         else:
@@ -287,14 +311,16 @@ def save_video(frames, save_path, fps=30, quality=5):
             is_mp4 = save_path.lower().endswith('.mp4') or save_path.lower().endswith('.mov') or save_path.lower().endswith('.mkv')
             
             if NVENC_AVAILABLE and is_mp4:
-                # Fallback to QP for robustness
-                qp = int(35 - quality * 1.5)
-                encoding_args = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-qp', str(qp), '-pix_fmt', 'yuv420p']
+                # Map quality (0-10) to QP (26-20): quality 10 -> QP 20, quality 0 -> QP 26
+                qp = int(26 - quality * 0.6)
+                encoding_args = ['-c:v', 'h264_nvenc', '-preset', 'p1', '-qp', str(qp), '-pix_fmt', 'yuv420p']
             elif is_mp4:
-                encoding_args = ['-c:v', 'libx264', '-preset', 'faster', '-crf', str(23-quality*2), '-pix_fmt', 'yuv420p']
+                # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
+                crf = int(26 - quality * 0.6)
+                encoding_args = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film', '-crf', str(crf), '-pix_fmt', 'yuv420p']
             else:
-                # Just use default libx264 for other containers if possible, or raise to hit GIF fallback
-                encoding_args = ['-c:v', 'libx264', '-preset', 'faster', '-crf', str(23-quality*2), '-pix_fmt', 'yuv420p']
+                crf = int(26 - quality * 0.6)
+                encoding_args = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film', '-crf', str(crf), '-pix_fmt', 'yuv420p']
 
             cmd = [
                 'ffmpeg', '-y',

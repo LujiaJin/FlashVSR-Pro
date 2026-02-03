@@ -11,7 +11,7 @@ def main():
     # 文件过滤规则 / Rules
     # 排除列表 (文件名)
     EXCLUDE_FILES = {
-        "MyOwnSwordsman_S01E01.mp4"
+        "MyOwnSwordsman_S01E01.mp4",
         "MyOwnSwordsman_S01E01_1080p.mp4"
     }
     
@@ -32,80 +32,84 @@ def main():
         sys.exit(1)
 
 
-    # 1. 常规批量推理（原有逻辑）
-    # processed_files = []
-    # for root, dirs, files in os.walk(INPUT_DIR):
-    #     for filename in files:
-    #         file_path = Path(root) / filename
-    #         if file_path.suffix.lower() not in VIDEO_EXTS:
-    #             continue
-    #         if filename in EXCLUDE_FILES:
-    #             print(f"[SKIP] Excluding specific file: {file_path}")
-    #             continue
-    #         rel_path = file_path.relative_to(INPUT_DIR)
-    #         target_dir = OUTPUT_DIR / rel_path.parent
-    #         target_dir.mkdir(parents=True, exist_ok=True)
-    #         cmd = [
-    #             "python", "infer.py",
-    #             "-i", str(file_path),
-    #             "-o", str(target_dir),
-    #             "--mode", "tiny-long",
-    #             "--scale", "4.0"
-    #         ]
-    #         if filename in SPECIAL_CONFIGS:
-    #             extra_args = SPECIAL_CONFIGS[filename]
-    #             cmd.extend(extra_args)
-    #             print(f"[CONFIG] Applying specific args {extra_args} for {filename}")
-    #         print(f"Processing: {rel_path} -> {target_dir}")
-    #         try:
-    #             subprocess.run(cmd, check=True)
-    #             processed_files.append((file_path, rel_path, target_dir))
-    #         except subprocess.CalledProcessError:
-    #             print(f"!!! Error occurred while processing {filename}")
-    #             continue
-
-    # 2. 检查缺失的x4结果（有x2但无x4）并补充tile_dit处理
-    print("\n[Tile补充] 检查缺失的x4结果并补充处理...")
-    # 获取所有输入视频名
-    input_dir = INPUT_DIR / "JIUTIAN-gen"
-    result_dir = OUTPUT_DIR / "JIUTIAN-gen"
-    input_videos = [f for f in input_dir.iterdir() if f.suffix.lower() in VIDEO_EXTS]
-    # 生成x2/x4结果名
-    missing_tile_list = []
-    for f in input_videos:
-        name = f.stem
-        x2 = result_dir / f"FlashVSR-Pro_tiny_scale2.0_{name}.mp4"
-        x4 = result_dir / f"FlashVSR-Pro_tiny-long_scale4.0_{name}.mp4"
-        if x2.exists() and not x4.exists():
-            missing_tile_list.append(f)
-    if missing_tile_list:
-        print("以下视频缺失x4结果，将用tile_dit补充处理：")
-        for f in missing_tile_list:
-            print(f"  {f}")
-        for f in missing_tile_list:
-            rel_path = f.relative_to(INPUT_DIR)
+    # 1. 常规批量推理
+    processed_count = 0
+    skipped_count = 0
+    
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for filename in files:
+            file_path = Path(root) / filename
+            
+            # Check extension
+            if file_path.suffix.lower() not in VIDEO_EXTS:
+                continue
+                
+            # Check exclusion
+            if filename in EXCLUDE_FILES:
+                print(f"[SKIP] Excluding specific file: {file_path}")
+                skipped_count += 1
+                continue
+            
+            # Calculate output path and maintain directory structure
+            try:
+                rel_path = file_path.relative_to(INPUT_DIR)
+            except ValueError:
+                continue
+                
             target_dir = OUTPUT_DIR / rel_path.parent
             target_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [
+            
+            # Construct command
+            # Requirements: tiny-long mode, x4 scale
+            # Using tiny-long as requested to save memory on long videos
+            base_cmd = [
                 "python", "infer.py",
-                "-i", str(f),
+                "-i", str(file_path),
                 "-o", str(target_dir),
                 "--mode", "tiny-long",
-                "--scale", "4.0",
-                "--tile-dit",
-                "--tile-size", "192",
-                "--overlap", "32"
+                "--scale", "4.0"
             ]
-            print(f"[Tile补充] Processing: {rel_path} -> {target_dir}")
-            try:
-                subprocess.run(cmd, check=True)
-            except subprocess.CalledProcessError:
-                print(f"!!! Error occurred while tile-processing {f.name}")
+            
+            if filename in SPECIAL_CONFIGS:
+                extra_args = SPECIAL_CONFIGS[filename]
+                base_cmd.extend(extra_args)
+                print(f"[CONFIG] Applying specific args {extra_args} for {filename}")
+            
+            print(f"[{processed_count+1}] Processing: {rel_path} -> {target_dir} (tiny-long x4)")
+            
+            # Define retry strategies
+            # 1. Standard: No tiling (fastest)
+            # 2. Tile DiT: Save DiT memory
+            # 3. Tile DiT + VAE: Save VAE memory too
+            # 4. Small Tile: Minimal memory usage (tile-size 128 is usually a safe multiple of 64/32)
+            strategies = [
+                {"name": "Standard (No Tiling)", "args": []},
+                {"name": "Tile DiT", "args": ["--tile-dit"]},
+                {"name": "Tile DiT + VAE", "args": ["--tile-dit", "--tile-vae"]},
+                {"name": "Small Tile (Size 128/Overlap 24)", "args": ["--tile-dit", "--tile-vae", "--tile-size", "128", "--overlap", "24"]}
+            ]
+            
+            success = False
+            for strategy in strategies:
+                print(f"  > Attempting: {strategy['name']}...")
+                current_cmd = base_cmd + strategy["args"]
+                
+                try:
+                    subprocess.run(current_cmd, check=True)
+                    print(f"  > [SUCCESS] Processed using {strategy['name']}")
+                    success = True
+                    break
+                except subprocess.CalledProcessError as e:
+                    print(f"  > Failed: {strategy['name']} (Exit Code: {e.returncode})")
+                    # Continue to next strategy
+            
+            if success:
+                processed_count += 1
+            else:
+                print(f"!!! All attempts failed for {filename}. Skipping.")
                 continue
-    else:
-        print("所有x4结果均已存在，无需补充tile处理。")
 
-    print("Batch processing completed.")
+    print(f"\nBatch processing completed. Processed: {processed_count}, Skipped: {skipped_count}")
 
 if __name__ == "__main__":
     main()
