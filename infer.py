@@ -150,6 +150,11 @@ def parse_args():
                        choices=["fp32", "fp16", "bf16"],
                        help="Data type")
     
+    # Encoding optimization for long video workflow
+    parser.add_argument("--slow-encode", action="store_true",
+                       help="Use slower but more efficient encoding (smaller file size). "
+                            "Recommended for long videos processed via long_video_worker.py")
+    
     return parser.parse_args()
 
 def tensor2video(frames: torch.Tensor):
@@ -185,8 +190,13 @@ def is_video(path):
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv','.webm'))
 
 
-def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quality=10):
-    """Save frames as video with audio directly using ffmpeg pipe"""
+def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quality=10, slow_encode=False):
+    """Save frames as video with audio directly using ffmpeg pipe
+    
+    Args:
+        slow_encode: If True, use slower but more efficient encoding (smaller files).
+                    Recommended for long video workflow.
+    """
     if not frames: return False
     
     # Handle numpy arrays (H, W, C) vs PIL Images (W, H)
@@ -195,33 +205,59 @@ def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quali
     else:
         w, h = frames[0].size
 
-    # Approximation of quality to CRF/CQ: quality 10 -> crf 3, quality 5 -> crf 13, quality 0 -> crf 23
-    # For NVENC, we use -cq (Constant Quality) and -rc vbr
+    # === ENCODING SETTINGS ===
+    # Key principles for long video concatenation:
+    # 1. Fixed GOP size (keyint=60) for predictable segment boundaries
+    # 2. Consistent timescale (90000) for seamless concatenation
+    # 3. Standardized audio format
+    
+    # Map quality (0-10) to CRF: quality 10 -> CRF 18, quality 5 -> CRF 21, quality 0 -> CRF 24
+    crf = int(24 - quality * 0.6)
     
     if NVENC_AVAILABLE:
-        # NVENC settings - optimized for speed
+        # NVENC settings
         vcodec = 'h264_nvenc'
-        # Map quality (0-10) to CQ (26-20): quality 10 -> CQ 20, quality 0 -> CQ 26
-        cq = int(26 - quality * 0.6)
+        cq = crf
+        # p4 is balanced, p1 is fastest - both work well with NVENC
+        nvenc_preset = 'p4' if slow_encode else 'p1'
         encoding_args = [
             '-c:v', vcodec,
-            '-preset', 'p1',      # p1 is fastest NVENC preset
+            '-preset', nvenc_preset,
             '-rc', 'vbr',
             '-cq', str(cq),
-            '-b:v', '0',          # Let VBR handle bitrate
+            '-b:v', '0',
+            '-g', '60',             # Fixed GOP for concatenation
+            '-bf', '2',
+            '-profile:v', 'high',
         ]
     else:
-        # CPU x264 settings - optimized for speed and reasonable file size
+        # CPU x264 settings
         vcodec = 'libx264'
-        # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
-        # CRF 20-22 is visually lossless for most content
-        crf = int(26 - quality * 0.6)
-        encoding_args = [
-            '-c:v', vcodec,
-            '-preset', 'veryfast',   # Much faster than 'faster', minimal quality loss
-            '-crf', str(crf),
-            '-tune', 'film',         # Optimize for high-quality video content
-        ]
+        # slow = better compression, veryfast = faster encoding
+        x264_preset = 'slow' if slow_encode else 'veryfast'
+        
+        if slow_encode:
+            # Full optimization for smaller files
+            encoding_args = [
+                '-c:v', vcodec,
+                '-preset', x264_preset,
+                '-crf', str(crf),
+                '-tune', 'film',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-g', '60',
+                '-bf', '2',
+                '-x264-params', 'ref=4:bframes=2:b-adapt=2:direct=auto:me=umh:subme=8:trellis=2',
+            ]
+        else:
+            # Fast encoding for short videos
+            encoding_args = [
+                '-c:v', vcodec,
+                '-preset', x264_preset,
+                '-crf', str(crf),
+                '-tune', 'film',
+                '-g', '60',             # Still need fixed GOP for potential concatenation
+            ]
 
     cmd = [
         'ffmpeg', '-y',
@@ -236,10 +272,14 @@ def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quali
         '-map', '0:v',      # Map video from input 0
         '-map', '1:a',      # Map audio from input 1
         '-pix_fmt', 'yuv420p', # Ensure compatibility
+        '-video_track_timescale', '90000',  # Standard timescale for MP4
         *encoding_args,     # Inject codec specific args
         '-c:a', 'aac',      # Re-encode audio to aac for compatibility
         '-b:a', '192k',
+        '-ar', '48000',     # Standardize sample rate for consistent concatenation
+        '-ac', '2',         # Standardize to stereo
         '-shortest',        # Finish when shortest stream ends
+        '-movflags', '+faststart',  # Enable fast start for streaming
         output_path
     ]
 
@@ -261,115 +301,105 @@ def save_video_with_audio_piped(frames, output_path, audio_source, fps=30, quali
     return True
 
 
-def save_video(frames, save_path, fps=30, quality=5):
-    """Save frames as video"""
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    ext = os.path.splitext(save_path)[-1].lower()
+def save_video(frames, save_path, fps=30, quality=5, slow_encode=False):
+    """Save frames as video.
     
-    # Map common video extensions to imageio formats
-    format_map = {
-        '.mp4': 'FFMPEG',
-        '.avi': 'FFMPEG',
-        '.mov': 'FFMPEG',
-        '.mkv': 'FFMPEG',
-        '.webm': 'FFMPEG',
-        '.gif': 'GIF',
-    }
-    format_name = format_map.get(ext, 'FFMPEG')
-
-    try:
-        if NVENC_AVAILABLE and format_name == 'FFMPEG':
-            # NVENC settings for imageio
-            # Map quality (0-10) to QP (26-20): quality 10 -> QP 20, quality 0 -> QP 26
-            qp = int(26 - quality * 0.6)
-            w = imageio.get_writer(save_path, fps=fps, codec='h264_nvenc', quality=None,
-                                 pixelformat='yuv420p', ffmpeg_params=['-preset', 'p1', '-qp', str(qp)])
-        elif format_name == 'FFMPEG':
-            # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
-            crf = int(26 - quality * 0.6)
-            w = imageio.get_writer(save_path, fps=fps, codec='libx264', quality=None,
-                                 pixelformat='yuv420p', ffmpeg_params=['-preset', 'veryfast', '-tune', 'film', '-crf', str(crf)])
-        elif format_name == 'GIF':
-            w = imageio.get_writer(save_path, fps=fps, format='GIF')
+    Args:
+        slow_encode: If True, use slower but more efficient encoding (smaller files).
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    
+    # === Direct FFmpeg pipe (preferred method for consistent encoding) ===
+    sample_frame = np.array(frames[0])
+    height, width = sample_frame.shape[:2]
+    
+    # Map quality (0-10) to CRF: quality 10 -> CRF 18, quality 5 -> CRF 21, quality 0 -> CRF 24
+    crf = int(24 - quality * 0.6)
+    
+    if NVENC_AVAILABLE:
+        nvenc_preset = 'p4' if slow_encode else 'p1'
+        encoding_args = [
+            '-c:v', 'h264_nvenc',
+            '-preset', nvenc_preset,
+            '-rc', 'vbr',
+            '-cq', str(crf),
+            '-b:v', '0',
+            '-g', '60',
+            '-bf', '2',
+            '-profile:v', 'high',
+        ]
+    else:
+        x264_preset = 'slow' if slow_encode else 'veryfast'
+        if slow_encode:
+            encoding_args = [
+                '-c:v', 'libx264',
+                '-preset', x264_preset,
+                '-crf', str(crf),
+                '-tune', 'film',
+                '-profile:v', 'high',
+                '-level', '4.1',
+                '-g', '60',
+                '-bf', '2',
+                '-x264-params', 'ref=4:bframes=2:b-adapt=2:direct=auto:me=umh:subme=8:trellis=2',
+            ]
         else:
-            w = imageio.get_writer(save_path, fps=fps, quality=quality)
+            encoding_args = [
+                '-c:v', 'libx264',
+                '-preset', x264_preset,
+                '-crf', str(crf),
+                '-tune', 'film',
+                '-g', '60',
+            ]
 
+    cmd = [
+        'ffmpeg', '-y',
+        '-hide_banner', '-loglevel', 'error',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}',
+        '-pix_fmt', 'rgb24',
+        '-r', str(fps),
+        '-i', '-',
+        '-pix_fmt', 'yuv420p',
+        '-video_track_timescale', '90000',
+        *encoding_args,
+        '-movflags', '+faststart',
+        save_path
+    ]
+    
+    try:
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        
         for f in tqdm(frames, desc="Saving"):
+            process.stdin.write(np.array(f).tobytes())
+        
+        out, err = process.communicate()
+        
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd, stderr=err)
+            
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Warning: Direct ffmpeg failed ({e}), falling back to imageio")
+        
+        # Fallback to imageio (less optimal but works)
+        ext = os.path.splitext(save_path)[-1].lower()
+        x264_preset = 'slow' if slow_encode else 'veryfast'
+        nvenc_preset = 'p4' if slow_encode else 'p1'
+        
+        if ext == '.gif':
+            w = imageio.get_writer(save_path, fps=fps, format='GIF')
+        elif NVENC_AVAILABLE:
+            qp = int(24 - quality * 0.6)
+            w = imageio.get_writer(save_path, fps=fps, codec='h264_nvenc', quality=None,
+                                 pixelformat='yuv420p', ffmpeg_params=['-preset', nvenc_preset, '-qp', str(qp), '-g', '60'])
+        else:
+            w = imageio.get_writer(save_path, fps=fps, codec='libx264', quality=None,
+                                 pixelformat='yuv420p', ffmpeg_params=['-preset', x264_preset, '-tune', 'film', '-crf', str(crf), '-g', '60'])
+
+        for f in tqdm(frames, desc="Saving (fallback)"):
             w.append_data(np.array(f))
         w.close()
-    except Exception as e:
-        print(f"Warning: imageio writer failed ({e}), falling back to direct ffmpeg pipe")
-        
-        # Fallback: Pipe directly to ffmpeg (much faster than saving frames to disk)
-        import subprocess
-        
-        try:
-            sample_frame = np.array(frames[0])
-            height, width = sample_frame.shape[:2]
-            
-            encoding_args = []
-            is_mp4 = save_path.lower().endswith('.mp4') or save_path.lower().endswith('.mov') or save_path.lower().endswith('.mkv')
-            
-            if NVENC_AVAILABLE and is_mp4:
-                # Map quality (0-10) to QP (26-20): quality 10 -> QP 20, quality 0 -> QP 26
-                qp = int(26 - quality * 0.6)
-                encoding_args = ['-c:v', 'h264_nvenc', '-preset', 'p1', '-qp', str(qp), '-pix_fmt', 'yuv420p']
-            elif is_mp4:
-                # Map quality (0-10) to CRF (26-20): quality 10 -> CRF 20, quality 0 -> CRF 26
-                crf = int(26 - quality * 0.6)
-                encoding_args = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film', '-crf', str(crf), '-pix_fmt', 'yuv420p']
-            else:
-                crf = int(26 - quality * 0.6)
-                encoding_args = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'film', '-crf', str(crf), '-pix_fmt', 'yuv420p']
 
-            cmd = [
-                'ffmpeg', '-y',
-                '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-s', f'{width}x{height}',
-                '-pix_fmt', 'rgb24',
-                '-r', str(fps),
-                '-i', '-', # Input from pipe
-                '-an', # No audio
-                *encoding_args,
-                save_path
-            ]
-            
-            print(f"Executing fallback FFmpeg command...")
-            process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            for f in tqdm(frames, desc="Streaming to FFmpeg"):
-                # Ensure frame is contiguous bytes
-                img_data = np.array(f).tobytes()
-                try:
-                    process.stdin.write(img_data)
-                except BrokenPipeError:
-                    print("FFmpeg pipe broken during writing.")
-                    break
-            
-            out, err = process.communicate()
-            if process.returncode != 0:
-                print(f"FFmpeg Error: {err.decode('utf-8', errors='ignore')}")
-                raise subprocess.CalledProcessError(process.returncode, cmd)
-                
-        except (subprocess.CalledProcessError, FileNotFoundError, ValueError, Exception) as e:
-            print(f"Video saving failed: {e}")
-            # Final fallback: just save as GIF
-            print("Warning: ffmpeg not available, saving as GIF (This may be slow)")
-            # Ensure we have a valid GIF path
-            gif_path = save_path
-            if not gif_path.lower().endswith('.gif'):
-                root, _ = os.path.splitext(save_path)
-                gif_path = root + ".gif"
-            
-            try:
-                # Convert to PIL if necessary
-                pil_frames = [Image.fromarray(f) if isinstance(f, np.ndarray) else f for f in frames]
-                pil_frames[0].save(gif_path, save_all=True, append_images=pil_frames[1:],
-                             duration=1000//fps, loop=0)
-                print(f"Saved as GIF: {gif_path}")
-            except Exception as gif_error:
-                print(f"Failed to save GIF: {gif_error}")
 
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: float = 2.0, multiple: int = 128):
     """Compute scaled dimensions and target dimensions"""
@@ -981,13 +1011,13 @@ def main():
     if args.keep_audio and input_video_path and is_video(input_video_path) and has_audio_stream(input_video_path):
         # Optimized: piped saving (single pass)
         print("Preserving audio (streaming mode)...")
-        success = save_video_with_audio_piped(frames, output_path, input_video_path, fps=fps, quality=args.quality)
+        success = save_video_with_audio_piped(frames, output_path, input_video_path, fps=fps, quality=args.quality, slow_encode=args.slow_encode)
         
         if not success:
             print("Piping failed, falling back to temp file method...")
             # Fallback: save silent video first, then merge audio
             temp_output = output_path.replace('.mp4', '_temp.mp4')
-            save_video(frames, temp_output, fps=fps, quality=args.quality)
+            save_video(frames, temp_output, fps=fps, quality=args.quality, slow_encode=args.slow_encode)
             print("Preserving audio (merge mode)...")
             copy_video_with_audio(input_video_path, temp_output, output_path)
             # Clean up temp file
@@ -995,7 +1025,7 @@ def main():
                 os.remove(temp_output)
     else:
         # No audio to preserve: save directly to final output
-        save_video(frames, output_path, fps=fps, quality=args.quality)
+        save_video(frames, output_path, fps=fps, quality=args.quality, slow_encode=args.slow_encode)
 
     print(f"Done!\nOutput: {output_path}")
 
