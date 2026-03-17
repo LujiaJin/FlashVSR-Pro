@@ -309,6 +309,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         local_range = 9,
         color_fix = True,
         decoding_msg = None,
+        lq_bootstrap_windows: int = 7,
     ):
         # Only accept cfg=1.0 (consistent with original code)
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -339,7 +340,14 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
-        process_total_num = (num_frames - 1) // 8 - 2
+        # Streaming DiT start requires at least 6 latent frames when KV cache is empty.
+        # For short clips with if_buffer=True, (num_frames-1)//4 may be < 6, so pad by repeating last.
+        if latents.shape[2] < 6:
+            pad = 6 - latents.shape[2]
+            latents = torch.cat([latents, latents[:, :, -1:, :, :].repeat(1, 1, pad, 1, 1)], dim=2)
+
+        # Guarantee at least one streaming step for short batches (9/13/17).
+        process_total_num = max(1, (num_frames - 1) // 8 - 2)
         is_stream = True
 
         # Clean potential LQ_proj_in cache
@@ -367,7 +375,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
                     LQ_latents = None
-                    inner_loop_num = 7
+                    # Allow reduced bootstrap windows for realtime to reduce first-batch spike and
+                    # to support batch-size < 25. Also cap by what current num_frames can cover.
+                    max_windows_by_frames = (max(num_frames, 1) + 2) // 4 + 1
+                    inner_loop_num = max(1, min(int(lq_bootstrap_windows), int(max_windows_by_frames)))
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :].to(self.device)
@@ -379,7 +390,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
-                    LQ_cur_idx = (inner_loop_num-1)*4-3
+                    if inner_loop_num == 7 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7:
+                        LQ_cur_idx = (inner_loop_num - 1) * 4 - 3  # legacy: 21
+                    else:
+                        LQ_cur_idx = min(num_frames, inner_loop_num * 4 - 3)
                     cur_latents = latents[:, :, :6, :, :]
                 else:
                     LQ_latents = None
@@ -423,7 +437,17 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 cur_latents = cur_latents - noise_pred_posi
                 # Decode
                 cur_LQ_frame = LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)
-                cur_frames = self.TCDecoder.decode_video(cur_latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,LQ_pre_idx:LQ_cur_idx,:,:].to(self.device)).transpose(1, 2).mul_(2).sub_(1)
+                # For short / reduced-bootstrap streams, disable cond to avoid temporal/channel mismatches
+                # inside TCDecoder when latent/LQ alignment is not the original 25-frame schedule.
+                use_cond_for_decode = (LQ_cur_idx >= 25 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7)
+                cond_for_decode = cur_LQ_frame if use_cond_for_decode else None
+                cur_frames = self.TCDecoder.decode_video(
+                    cur_latents.transpose(1, 2),
+                    parallel=False,
+                    show_progress_bar=False,
+                    cond=cond_for_decode,
+                    decoding_msg=None,
+                ).transpose(1, 2).mul_(2).sub_(1)
 
                 # Color correction (wavelet)
                 try:
@@ -509,6 +533,23 @@ def model_fn_wan_video(
     # Block Stacking
     for block_id, block in enumerate(dit.blocks):
         if LQ_latents is not None and block_id < len(LQ_latents):
+            lq = LQ_latents[block_id]
+            # Robustness for short / padded streams (see tiny pipeline):
+            # ensure token length matches current x by padding/truncating on token dim.
+            if lq is not None and lq.shape[1] != x.shape[1]:
+                if lq.shape[1] > x.shape[1]:
+                    lq = lq[:, :x.shape[1], :]
+                else:
+                    tokens_per_f = x.shape[1] // f
+                    if tokens_per_f > 0 and lq.shape[1] >= tokens_per_f:
+                        need = x.shape[1] - lq.shape[1]
+                        reps = (need + tokens_per_f - 1) // tokens_per_f
+                        pad_chunk = lq[:, -tokens_per_f:, :].repeat(1, reps, 1)[:, :need, :]
+                        lq = torch.cat([lq, pad_chunk], dim=1)
+                    else:
+                        need = x.shape[1] - lq.shape[1]
+                        lq = torch.cat([lq, lq[:, -1:, :].repeat(1, need, 1)], dim=1)
+                LQ_latents[block_id] = lq
             x = x + LQ_latents[block_id]
         x, last_pre_cache_k, last_pre_cache_v = block(
             x, context, t_mod, freqs, f, h, w,

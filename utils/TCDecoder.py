@@ -316,10 +316,20 @@ class TAEHV(nn.Module):
             if use_cond:
                 x = torch.cat([pixel_shuffled_cond, x], dim=2)
             elif current_channels != expected_channels:
-                # Handle channel mismatch (e.g., 16 vs 32)
-                if current_channels == 16 and expected_channels == 32:
-                    # Pad/Repeat to match expected channels
-                    x = torch.cat([x, x], dim=2)
+                # Generic channel-matching fallback when cond is unused or insufficient:
+                # replicate latent channels to reach the expected conv input size.
+                N, T, C, H, W = x.shape
+                if expected_channels % C == 0:
+                    repeat_factor = expected_channels // C
+                    x = x.reshape(N * T, C, H, W)
+                    x = x.repeat(1, repeat_factor, 1, 1)
+                    x = x.reshape(N, T, expected_channels, H, W)
+                else:
+                    # Last-resort: pad with zeros to expected_channels
+                    pad_channels = expected_channels - C
+                    if pad_channels > 0:
+                        pad = x.new_zeros(N, T, pad_channels, H, W)
+                        x = torch.cat([x, pad], dim=2)
 
         x, self.mem = apply_model_with_memblocks(self.decoder, x, parallel, show_progress_bar, mem=self.mem, desc=decoding_msg)
 

@@ -453,6 +453,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         local_range = 9,
         color_fix = True,
         decoding_msg = None,
+        lq_bootstrap_windows: int = 7,
     ):
         # Only accept cfg=1.0 (Consistent with original code)
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
@@ -483,7 +484,17 @@ class FlashVSRTinyPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
 
-        process_total_num = (num_frames - 1) // 8 - 2
+        # Streaming path needs at least 6 latent frames for the first step:
+        # WanVideoDiT.SelfAttention enforces f==6 when starting a new stream block (no KV cache yet).
+        # For short clips with if_buffer=True, (num_frames-1)//4 can be < 6 (e.g. 17 frames -> 4),
+        # so we pad the latent time dimension by repeating the last frame.
+        if latents.shape[2] < 6:
+            pad = 6 - latents.shape[2]
+            latents = torch.cat([latents, latents[:, :, -1:, :, :].repeat(1, 1, pad, 1, 1)], dim=2)
+
+        # For short clips / realtime batches (e.g., 9/17 frames), the original formula becomes <= 0,
+        # which would skip inference entirely. We guarantee at least one process step.
+        process_total_num = max(1, (num_frames - 1) // 8 - 2)
         is_stream = True
 
         # Clear potential LQ_proj_in cache
@@ -501,7 +512,12 @@ class FlashVSRTinyPipeline(BasePipeline):
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
                     LQ_latents = None
-                    inner_loop_num = 7
+                    # Original code used 7 windows, which assumes 25 LQ frames are available:
+                    # end index sequence: 1, 5, 9, 13, 17, 21, 25
+                    # For realtime, allow fewer windows to reduce first-batch spike and to support
+                    # batch-size < 25. We also cap by what current num_frames can cover.
+                    max_windows_by_frames = (max(num_frames, 1) + 2) // 4 + 1
+                    inner_loop_num = max(1, min(int(lq_bootstrap_windows), int(max_windows_by_frames)))
                     for inner_idx in range(inner_loop_num):
                         cur = self.denoising_model().LQ_proj_in.stream_forward(
                             LQ_video[:, :, max(0, inner_idx*4-3):(inner_idx+1)*4-3, :, :]
@@ -513,7 +529,12 @@ class FlashVSRTinyPipeline(BasePipeline):
                         else:
                             for layer_idx in range(len(LQ_latents)):
                                 LQ_latents[layer_idx] = torch.cat([LQ_latents[layer_idx], cur[layer_idx]], dim=1)
-                    LQ_cur_idx = (inner_loop_num-1)*4-3
+                    # Keep original behavior for the default long-clip case (25 frames, 7 windows),
+                    # but for reduced-window / short batches, advance LQ_cur_idx to the covered end.
+                    if inner_loop_num == 7 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7:
+                        LQ_cur_idx = (inner_loop_num - 1) * 4 - 3  # legacy: 21
+                    else:
+                        LQ_cur_idx = min(num_frames, inner_loop_num * 4 - 3)
                     cur_latents = latents[:, :, :6, :, :]
                 else:
                     LQ_latents = None
@@ -560,13 +581,15 @@ class FlashVSRTinyPipeline(BasePipeline):
 
             latents = torch.cat(latents_total, dim=2)
 
-            # Decode: pass decoding_msg to TCDecoder if present to render as progress description
-            # If present, we do NOT print "Decoding video..." manually to avoid newlines.
-            
+            # Decode: for very short / reduced-bootstrap streams, disable cond to avoid
+            # temporal/channel mismatches inside TCDecoder when latent time has been padded.
+            use_cond_for_decode = (LQ_cur_idx >= 25 and num_frames >= 25 and int(lq_bootstrap_windows) >= 7)
+            cond_for_decode = LQ_video[:, :, :LQ_cur_idx, :, :] if (LQ_video is not None and use_cond_for_decode) else None
+
             if tiled:
                 frames = self._tiled_decode(
                     latents,
-                    cond=LQ_video[:,:,:LQ_cur_idx,:,:],
+                    cond=cond_for_decode,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
                     decoding_msg=decoding_msg if decoding_msg else "Decoding video (Tiled)"
@@ -576,7 +599,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     latents.transpose(1, 2),
                     parallel=False, 
                     show_progress_bar=True, 
-                    cond=LQ_video[:,:,:LQ_cur_idx,:,:],
+                    cond=cond_for_decode,
                     decoding_msg=decoding_msg if decoding_msg else "Decoding video" # If no msg, default to "Decoding video"
                 ).transpose(1, 2).mul_(2).sub_(1)
 
@@ -659,6 +682,27 @@ def model_fn_wan_video(
     # Block Stacking
     for block_id, block in enumerate(dit.blocks):
         if LQ_latents is not None and block_id < len(LQ_latents):
+            lq = LQ_latents[block_id]
+            # Robustness for short / padded streams:
+            # LQ_proj_in.stream_forward emits one latent-time slice per call (first call returns None),
+            # so with reduced bootstrap windows, lq token length can be smaller than current x.
+            # We pad by repeating the last time-slice worth of tokens so shapes match.
+            if lq is not None and lq.shape[1] != x.shape[1]:
+                if lq.shape[1] > x.shape[1]:
+                    lq = lq[:, :x.shape[1], :]
+                else:
+                    # tokens per latent frame at current resolution
+                    tokens_per_f = x.shape[1] // f
+                    if tokens_per_f > 0 and lq.shape[1] >= tokens_per_f:
+                        need = x.shape[1] - lq.shape[1]
+                        reps = (need + tokens_per_f - 1) // tokens_per_f
+                        pad_chunk = lq[:, -tokens_per_f:, :].repeat(1, reps, 1)[:, :need, :]
+                        lq = torch.cat([lq, pad_chunk], dim=1)
+                    else:
+                        # Fallback: repeat last token if shape is unexpectedly small
+                        need = x.shape[1] - lq.shape[1]
+                        lq = torch.cat([lq, lq[:, -1:, :].repeat(1, need, 1)], dim=1)
+                LQ_latents[block_id] = lq
             x = x + LQ_latents[block_id]
         x, last_pre_cache_k, last_pre_cache_v = block(
             x, context, t_mod, freqs, f, h, w,

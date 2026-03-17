@@ -97,13 +97,14 @@ def check_nvenc_support():
         return False
 
 # Check NVENC support once at module level
-NVENC_AVAILABLE = check_nvenc_support()
+# NVENC_AVAILABLE = check_nvenc_support()
+NVENC_AVAILABLE = False
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FlashVSR-Pro Inference Script")
     
     # Basic parameters
-    parser.add_argument("-i", "--input", type=str, required=True,
+    parser.add_argument("-i", "--input", type=str, default="./inputs/example0.mp4",
                        help="Path to input video file or folder of images")
     parser.add_argument("-o", "--output", type=str, default="./results",
                        help="Output directory or file path")
@@ -149,6 +150,12 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="bf16",
                        choices=["fp32", "fp16", "bf16"],
                        help="Data type")
+    parser.add_argument(
+        "--lq-bootstrap-windows",
+        type=int,
+        default=4,
+        help="首段 LQ 特征预取窗口数（7 对应 25 帧；实时可用 2~4 降低首帧尖峰并支持 batch<25）",
+    )                   
     
     return parser.parse_args()
 
